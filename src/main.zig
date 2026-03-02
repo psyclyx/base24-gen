@@ -9,6 +9,7 @@
 //!   --author AUTHOR      Author string (default: "base24-gen")
 //!   --output FILE        Output path (default: stdout)
 //!   --preview            Print ANSI colour swatches to stderr
+//!   --terminal           Output OSC 4 escape sequences to set terminal palette
 
 const std = @import("std");
 const color = @import("color.zig");
@@ -27,6 +28,8 @@ const usage =
     \\  --author AUTHOR      Author string (default: "base24-gen")
     \\  --output FILE        Output YAML path (default: stdout)
     \\  --preview            Print ANSI colour swatches to stderr
+    \\  --terminal           Write OSC 4/10/11 sequences to set terminal palette
+    \\                       pipe to /dev/tty: base24-gen --terminal img.png >/dev/tty
     \\  --help               Show this help
     \\
 ;
@@ -45,6 +48,7 @@ pub fn main() !void {
     var author: []const u8 = "base24-gen";
     var output_path: ?[]const u8 = null;
     var preview = false;
+    var terminal = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -71,6 +75,8 @@ pub fn main() !void {
             output_path = args[i];
         } else if (std.mem.eql(u8, arg, "--preview")) {
             preview = true;
+        } else if (std.mem.eql(u8, arg, "--terminal")) {
+            terminal = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             log.err("Unknown option: {s}", .{arg});
             fatal("Run with --help for usage");
@@ -119,7 +125,9 @@ pub fn main() !void {
 
     log.info("Mode: {s}", .{@tagName(detected_mode)});
 
-    // Output YAML
+    // Output YAML — to --output file if given, else stdout.
+    // When --terminal is active and no --output is given, skip stdout YAML
+    // so the caller can pipe terminal sequences cleanly: cmd > /dev/tty
     if (output_path) |path| {
         const file = std.fs.cwd().createFile(path, .{}) catch |err| {
             log.err("Cannot open output '{s}': {}", .{ path, err });
@@ -127,13 +135,19 @@ pub fn main() !void {
         };
         defer file.close();
         try writeYaml(file, allocator, name, author, &pal);
-    } else {
+    } else if (!terminal) {
         try writeYaml(std.fs.File.stdout(), allocator, name, author, &pal);
     }
 
     // Optional ANSI preview to stderr
     if (preview) {
         try writePreview(std.fs.File.stderr(), allocator, &pal);
+    }
+
+    // Optional: write OSC 4/10/11 sequences to stdout.
+    // Typical use: base24-gen --terminal img.png > /dev/tty
+    if (terminal) {
+        try writeTerminalPalette(std.fs.File.stdout(), allocator, &pal);
     }
 }
 
@@ -211,6 +225,72 @@ fn writePreview(
         }
         try file.writeAll("\n\n");
     }
+}
+
+// ─── Terminal palette injection ───────────────────────────────────────────────
+//
+// Writes OSC 4 sequences to set the 16 ANSI palette colours and OSC 10/11
+// for default foreground/background. Pipe to /dev/tty to apply:
+//
+//   base24-gen --terminal img.png > /dev/tty
+//
+// Base24 → ANSI 16 colour mapping follows the conventional terminal assignment:
+//   0 black        base00  (default background)
+//   1 red          base08
+//   2 green        base0B
+//   3 yellow       base0A
+//   4 blue         base0D
+//   5 magenta      base0E
+//   6 cyan         base0C
+//   7 white        base05  (default foreground)
+//   8 bright black base03  (comments)
+//   9 bright red   base12
+//  10 bright green base14
+//  11 bright yellow base13
+//  12 bright blue  base16
+//  13 bright magenta base17
+//  14 bright cyan  base15
+//  15 bright white base07
+
+fn writeTerminalPalette(
+    file: std.fs.File,
+    allocator: std.mem.Allocator,
+    pal: *const palette.Palette,
+) !void {
+    const ansi = [16]color.Srgb{
+        pal.base00, pal.base08, pal.base0B, pal.base0A,
+        pal.base0D, pal.base0E, pal.base0C, pal.base05,
+        pal.base03, pal.base12, pal.base14, pal.base13,
+        pal.base16, pal.base17, pal.base15, pal.base07,
+    };
+
+    for (ansi, 0..) |c, i| {
+        const h = c.toHex();
+        const seq = try std.fmt.allocPrint(
+            allocator,
+            "\x1b]4;{};#{x:0>6}\x1b\\",
+            .{ i, h },
+        );
+        defer allocator.free(seq);
+        try file.writeAll(seq);
+    }
+
+    // Default foreground (base05) and background (base00)
+    const fg_seq = try std.fmt.allocPrint(
+        allocator,
+        "\x1b]10;#{x:0>6}\x1b\\",
+        .{pal.base05.toHex()},
+    );
+    defer allocator.free(fg_seq);
+    try file.writeAll(fg_seq);
+
+    const bg_seq = try std.fmt.allocPrint(
+        allocator,
+        "\x1b]11;#{x:0>6}\x1b\\",
+        .{pal.base00.toHex()},
+    );
+    defer allocator.free(bg_seq);
+    try file.writeAll(bg_seq);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
