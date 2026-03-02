@@ -129,10 +129,14 @@ const BRIGHT_DL: f32 = 0.10;
 const BRIGHT_DC: f32 = 0.03;
 
 // Maximum hue pull from image (degrees).
-const MAX_HUE_PULL: f32 = 25.0;
+// Tight enough to keep colours in their semantic families; the image can
+// bias a red slightly warm or cool, but not turn it orange.
+const MAX_HUE_PULL: f32 = 15.0;
 
 // Gaussian sigma for hue affinity (degrees).
-const HUE_SIGMA: f32 = 40.0;
+// Narrow sigma means only nearby image hues affect each accent, preventing
+// cross-family contamination (e.g. orange streetlights pulling red toward orange).
+const HUE_SIGMA: f32 = 25.0;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
