@@ -303,10 +303,24 @@ fn parseMode(s: []const u8) ?palette.Mode {
 
 fn stemOf(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
-    if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| {
-        return base[0..dot];
+    const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot|
+        base[0..dot]
+    else
+        base;
+    // Strip Nix store hash prefix ("<32 hex chars>-") so the scheme name
+    // doesn't contain a store path reference, which Nix forbids in outputs.
+    if (stem.len > 33 and stem[32] == '-') {
+        const prefix = stem[0..32];
+        var is_nix_hash = true;
+        for (prefix) |c| {
+            if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'z'))) {
+                is_nix_hash = false;
+                break;
+            }
+        }
+        if (is_nix_hash) return stem[33..];
     }
-    return base;
+    return stem;
 }
 
 fn fatal(msg: []const u8) noreturn {
