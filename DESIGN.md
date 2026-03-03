@@ -90,18 +90,26 @@ Eight semantic hue targets in OKLCh:
 | base0E | 328°     | Purple/Magenta |
 | base0F | 55°      | Brown (same hue as orange, lower L and C) |
 
-For each target, a **hue pull** is computed from the image profile:
+Each accent is generated in two passes:
 
-1. For each of the 8 image hue buckets, compute a Gaussian affinity weight
-   based on how far the bucket centroid is from the target (σ = 25°)
-2. Multiply by the bucket's normalised hue weight (image presence)
-3. Compute the weighted circular mean of angular offsets from target
-4. Scale by image saturation (`min(mean_chroma / 0.08, 1.0)`)
-5. Clamp the final offset to ±15° to stay within the colour family
+**Pass 1 — hue affinity scoring** (σ = 40°, wide):
+For each of the 8 accent targets, sum `hue_weight[i] × gauss(Δh, 40°)` over
+all image buckets. This produces a raw affinity score representing how much
+image content lives near each accent's hue family. Scores are normalised
+so the most image-present accent family scores 1.0.
 
-The accent **lightness** is fixed (0.65 dark / 0.52 light) and **chroma**
-is scaled between 0.10 and 0.20 by the image's p85 chroma, ensuring
-reasonable saturation even for washed-out images.
+**Pass 2 — per-accent synthesis:**
+1. **Chroma**: `C = lerp(MIN_C, C_ceiling, affinity_norm)` where
+   `C_ceiling = lerp(0.10, 0.28, p85_chroma / 0.15)`.
+   Image-dominant accents get vivid chroma; absent colour families fall
+   back to the 0.10 floor. The floor is always saturated enough to be legible.
+2. **Hue displacement**: computed via a tighter σ = 25° Gaussian to prevent
+   cross-family contamination, scaled by `mean_chroma / 0.08`.
+   Clamped to `lerp(10°, 25°, affinity_norm)` — dominant accents can shift
+   further toward their actual image centroid.
+
+The result: a pink-heavy image produces a vivid pink base0E and muted
+baseline cyan/green; a warm-orange image produces a vivid orange base09.
 
 ### 4. Bright variants (base12–17)
 
@@ -119,13 +127,17 @@ without distorting its semantic identity.
 
 | Constant | Value | Why |
 |----------|-------|-----|
-| `MAX_HUE_PULL` | 15° | Keeps accents in their colour family even in strongly biased images |
-| `HUE_SIGMA` | 25° | Only nearby image hues affect each accent; prevents cross-family bleed |
+| `HUE_SIGMA` | 25° | Narrow: only very nearby image hues displace each accent; prevents cross-family bleed |
+| `AFFINITY_SIGMA` | 40° | Wide: captures the warm/cool character of each colour family for chroma scaling |
+| `MAX_HUE_PULL_BASE` | 10° | Hue cap for accents absent from the image (stays near semantic target) |
+| `MAX_HUE_PULL_VIVID` | 25° | Hue cap for image-dominant accents (follows actual image centroid more closely) |
+| `MIN_ACCENT_C` | 0.10 | Floor chroma: every accent is clearly saturated even if not in the image |
+| `MAX_ACCENT_C` | 0.28 | Ceiling chroma: dominant accents in vivid images approach sRGB gamut boundary |
+| `CHROMA_SCALE_REF` | 0.15 | p85 chroma reference: images at or above this get fully vivid dominant accents |
 | `SAMPLE_LIMIT` | 16 384 | Fast analysis of 33MP images; <1% error vs full scan |
 | `CHROMA_THRESHOLD` | 0.04 | Excludes near-grey pixels from hue statistics |
 | Tone tint C | ≤ 0.012 | Perceptible to the algorithm but below display threshold |
 | Accent L (dark) | 0.65 | WCAG AA contrast (~4.5:1) on base00 (L=0.12) |
-| Accent C range | 0.10–0.20 | Minimum always saturated; maximum avoids over-saturation |
 
 ## Why not just extract colours?
 

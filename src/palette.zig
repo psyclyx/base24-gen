@@ -128,15 +128,30 @@ const ACCENT_TARGETS = [8]AccentTarget{
 const BRIGHT_DL: f32 = 0.10;
 const BRIGHT_DC: f32 = 0.03;
 
-// Maximum hue pull from image (degrees).
-// Tight enough to keep colours in their semantic families; the image can
-// bias a red slightly warm or cool, but not turn it orange.
-const MAX_HUE_PULL: f32 = 15.0;
+// Chroma range for accents.
+// MIN_ACCENT_C: guaranteed floor so every accent is clearly visible.
+// MAX_ACCENT_C: ceiling for accents whose hue family dominates the image.
+const MIN_ACCENT_C: f32 = 0.10;
+const MAX_ACCENT_C: f32 = 0.28;
 
-// Gaussian sigma for hue affinity (degrees).
-// Narrow sigma means only nearby image hues affect each accent, preventing
+// Image saturation reference for overall chroma scaling.
+// Images with p85_chroma ≥ this get fully vivid dominant accents.
+const CHROMA_SCALE_REF: f32 = 0.15;
+
+// Gaussian sigma for hue displacement (degrees).
+// Narrow: only very close image hues displace each accent, preventing
 // cross-family contamination (e.g. orange streetlights pulling red toward orange).
 const HUE_SIGMA: f32 = 25.0;
+
+// Gaussian sigma for hue affinity scoring (degrees).
+// Wider: captures the "this image feels warm/cool" character per accent family.
+const AFFINITY_SIGMA: f32 = 40.0;
+
+// Maximum hue displacement from image, per-accent:
+// - non-dominant accents (absent in image): clamped to BASE
+// - image-dominant accents: allowed up to VIVID
+const MAX_HUE_PULL_BASE: f32 = 10.0;
+const MAX_HUE_PULL_VIVID: f32 = 25.0;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -200,22 +215,42 @@ fn buildAccents(profile: analysis.ImageProfile, mode: Mode) [8]color.Srgb {
     // Base lightness for accents: readable on dark/light bg, not washed out.
     const accent_L: f32 = if (mode == .dark) 0.65 else 0.52;
 
-    // Chroma: scale between minimum usable and vivid, driven by image.
-    const min_C: f32 = 0.10;
-    const max_C: f32 = 0.20;
-    const chroma_scale = color.saturate(profile.p85_chroma / 0.20);
-    const accent_C = color.lerp(min_C, max_C, chroma_scale);
+    // Overall image saturation: how vivid is the image at all?
+    // Caps the chroma of even dominant accents for desaturated images.
+    const overall_scale = color.saturate(profile.p85_chroma / CHROMA_SCALE_REF);
 
-    // Influence scale: how much we let image bias the hue.
-    // A monochrome image has zero pull; a vivid image gets up to MAX_HUE_PULL.
+    // Hue displacement influence: a grey image has no opinion on hue.
     const influence = color.saturate(profile.mean_chroma / 0.08);
+
+    // Per-accent hue affinity: how much image content lives near each accent's
+    // hue target? Uses a wider sigma than the pull calculation so we capture
+    // the "warm/cool" character of each colour family in the image.
+    var affinities: [8]f32 = undefined;
+    var max_affinity: f32 = 0;
+    for (ACCENT_TARGETS, 0..) |target, i| {
+        affinities[i] = hueAffinity(profile, target.h);
+        if (affinities[i] > max_affinity) max_affinity = affinities[i];
+    }
+    // Normalise: most-present accent family scores 1.0, others are relative.
+    // Guard against all-grey images where every affinity is identical.
+    const aff_scale: f32 = if (max_affinity > 1e-6) 1.0 / max_affinity else 0.0;
 
     var result: [8]color.Srgb = undefined;
     for (ACCENT_TARGETS, 0..) |target, i| {
+        const aff = affinities[i] * aff_scale; // 0..1, relative to most dominant
+
+        // Chroma: image-dominant accents get more saturation than absent ones.
+        //   overall_scale drives the global ceiling (grey → muted, vivid → vivid).
+        //   aff drives how much of that ceiling this particular accent earns.
+        const C_ceiling = color.lerp(MIN_ACCENT_C, MAX_ACCENT_C, overall_scale);
+        const C = @max(0.0, color.lerp(MIN_ACCENT_C, C_ceiling, aff) + target.dC);
+
+        // Hue pull: dominant accents can shift further toward image hues.
+        const max_pull = color.lerp(MAX_HUE_PULL_BASE, MAX_HUE_PULL_VIVID, aff);
         const pull = huePull(profile, target.h) * influence;
-        const h = target.h + std.math.clamp(pull, -MAX_HUE_PULL, MAX_HUE_PULL);
+        const h = target.h + std.math.clamp(pull, -max_pull, max_pull);
+
         const L = accent_L + target.dL;
-        const C = @max(0.0, accent_C + target.dC);
         result[i] = color.lchToSrgb(color.clipToGamut(color.Lch.init(L, C, h)));
     }
     return result;
@@ -255,6 +290,17 @@ fn huePull(profile: analysis.ImageProfile, target_h: f32) f32 {
     if (w_total < 1e-6) return 0;
     const pull_rad = std.math.atan2(sin_acc / w_total, cos_acc / w_total);
     return pull_rad * (180.0 / std.math.pi);
+}
+
+/// How much image content lives near target_h (wider window than huePull).
+/// Returns a raw weight sum in [0, 1]; normalise across accents before use.
+fn hueAffinity(profile: analysis.ImageProfile, target_h: f32) f32 {
+    var w_total: f32 = 0;
+    for (0..8) |bi| {
+        const delta = color.angularDiff(profile.bucket_hues[bi], target_h);
+        w_total += profile.hue_weights[bi] * gaussianWeight(delta, AFFINITY_SIGMA);
+    }
+    return w_total;
 }
 
 fn gaussianWeight(delta: f32, sigma: f32) f32 {
