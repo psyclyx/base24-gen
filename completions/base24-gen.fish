@@ -1,0 +1,7 @@
+complete -c base24-gen -l mode -x -a "dark light" -d "Force dark or light mode"
+complete -c base24-gen -l name -x -d "Set colour scheme name"
+complete -c base24-gen -l author -x -d "Set author string"
+complete -c base24-gen -l output -rF -d "Write YAML to file instead of stdout"
+complete -c base24-gen -l preview -d "Print ANSI colour swatches to stderr"
+complete -c base24-gen -l terminal -d "Write OSC escape sequences to set terminal palette"
+complete -c base24-gen -l help -d "Show usage information"

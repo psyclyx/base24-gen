@@ -6,8 +6,8 @@ A deterministic, fast Base24 colour scheme generator. Given an image, it
 produces a `stylix`-compatible YAML palette that is:
 
 - **Semantically correct** — red stays reddish, green stays greenish, etc.
-- **Image-inspired** — the palette is biased toward the image's dominant hues
-  and luminance distribution, not merely extracted from it
+- **Image-inspired** — accent hues and chroma are derived from the image's
+  dominant colours, not merely pulled toward them
 - **Usable in degenerate cases** — monochrome, noise, and all-black/all-white
   images all produce valid, readable themes
 - **Deterministic** — same image → same palette, always
@@ -39,16 +39,16 @@ Sub-sample to ≤ 16 384 pixels for speed. For each pixel:
 
 - Convert to OKLCh
 - Accumulate L into a sorted list for percentile computation
-- If C > 0.04 (chromatic pixel): accumulate chroma-weighted hue into one of
-  8 buckets (each 45° wide)
+- If C > 0.04 (chromatic pixel): accumulate chroma-weighted hue into both
+  a coarse 8-bucket histogram (45° each) and a fine 36-bin histogram (10°
+  each)
 
 Output (`ImageProfile`):
 - `median_lightness`: drives dark/light mode detection (< 0.5 → dark)
 - `p10_lightness`, `p90_lightness`: shadow and highlight levels
-- `hue_weights[8]`: normalised bucket weights (how much of each hue family
-  is present in the image)
-- `bucket_hues[8]`: circular mean hue within each bucket (actual centroid,
-  not just midpoint)
+- `hue_weights[8]`, `bucket_hues[8]`: coarse histogram (used for tone tinting)
+- `fine_hue_weights[36]`, `fine_hue_centroids[36]`: fine histogram (used for
+  accent peak extraction)
 - `mean_chroma`, `p85_chroma`: overall and peak saturation of the image
 
 ### 2. Tone ramp generation (`palette.zig`)
@@ -71,9 +71,21 @@ In dark mode:
 
 Light mode mirrors this: L_light = 1 − L_dark.
 
-A **subtle tint** (C ≤ 0.012 at the image's primary hue) is applied to all
-tones so they feel connected to the image. At these chroma levels the tint
-is imperceptible on most displays but satisfies the constraint numerically.
+A **contrast-optimized tint** is applied to all tones at the image's primary
+hue. The tint chroma ceiling is `min(max(mean_chroma × 0.5, p85_chroma ×
+0.35), 0.06)`, then binary-searched (20 iterations) to find the highest
+value that satisfies all required contrast pairs. Using p85_chroma ensures
+images with localised vivid colour (but low mean chroma) still produce
+visibly tinted backgrounds.
+
+**Enforced contrast pairs:**
+- base05 on base00 ≥ 7.0:1 (primary text, WCAG AAA)
+- base07 on base00 ≥ 7.0:1 (bright foreground, AAA)
+- base05 on base02 ≥ 4.5:1 (text on selection, AA)
+- base04 on base01 ≥ 3.0:1 (status bar text, AA-large)
+
+Note: base03/base00 (comments) is intentionally low-contrast (~1.8:1 at the
+standard L values) and is not constrained — comments should be de-emphasized.
 
 ### 3. Accent colour generation (`palette.zig`)
 
@@ -90,32 +102,42 @@ Eight semantic hue targets in OKLCh:
 | base0E | 328°     | Purple/Magenta |
 | base0F | 55°      | Brown (same hue as orange, lower L and C) |
 
-Each accent is generated in two passes:
+Accents are generated through a three-stage pipeline:
 
-**Pass 1 — hue affinity scoring** (σ = 40°, wide):
-For each of the 8 accent targets, sum `hue_weight[i] × gauss(Δh, 40°)` over
-all image buckets. This produces a raw affinity score representing how much
-image content lives near each accent's hue family. Scores are normalised
-so the most image-present accent family scores 1.0.
+**Stage 1 — peak extraction** from the 36-bin fine hue histogram:
+- Bins with weight > 1.5/36 (~0.042) are marked significant
+- Adjacent significant bins are merged circularly into clusters
+- Each cluster yields a peak: circular weighted-mean centroid and summed weight
+- Peaks are sorted by weight (max 8)
 
-**Pass 2 — per-accent synthesis:**
-1. **Chroma**: `C = lerp(MIN_C, C_ceiling, affinity_norm)` where
-   `C_ceiling = lerp(0.10, 0.28, p85_chroma / 0.15)`.
-   Image-dominant accents get vivid chroma; absent colour families fall
-   back to the 0.10 floor. The floor is always saturated enough to be legible.
-2. **Hue displacement**: computed via a tighter σ = 25° Gaussian to prevent
-   cross-family contamination, scaled by `mean_chroma / 0.08`.
-   Clamped to `lerp(10°, 25°, affinity_norm)` — dominant accents can shift
-   further toward their actual image centroid.
+**Stage 2 — greedy assignment** of peaks to accent slots:
+- All (peak, slot) pairs within 45° angular distance are candidates
+- Candidates are sorted by distance; each peak and slot are used at most once
+- Slots with no matching peak remain unassigned
 
-The result: a pink-heavy image produces a vivid pink base0E and muted
-baseline cyan/green; a warm-orange image produces a vivid orange base09.
+**Stage 3 — accent synthesis:**
+- **Assigned slots**: hue = peak centroid, chroma = `lerp(0.10, C_ceiling,
+  sqrt(peak_weight / max_peak_weight))`. Image-present hues get vivid chroma
+  proportional to their dominance.
+- **Unassigned slots**: hue = canonical target, chroma = 0.05. Identifiable
+  by hue for syntax highlighting but clearly muted — no phantom saturation
+  for colours absent from the image.
+
+Lightness is optimized per-accent via binary search (20 iterations) for the
+L closest to the target (0.65 dark / 0.52 light) that guarantees:
+- ≥ 3.0:1 contrast against base00 and base01
+- ≥ 2.5:1 contrast against base02 (selection highlight)
 
 ### 4. Bright variants (base12–17)
 
-Bright variants are the 6 ANSI bright colours. They are derived from
-base08–0D (red through blue) by adding +0.10 L and +0.03 C, then
-re-clipping to gamut. base0F (brown) has no bright variant.
+Bright variants are the 6 ANSI bright colours, derived from base08–0D by
+adding +0.10 L and +0.03 C, then re-clipping to gamut. base0F (brown) has
+no bright variant.
+
+Each bright variant is **contrast-validated** against the same three
+backgrounds as normal accents (base00 at 3:1, base01 at 3:1, base02 at
+2.5:1). If the initial L shift fails contrast, L is binary-searched in the
+direction that restores it.
 
 ### 5. Gamut clipping
 
@@ -127,17 +149,20 @@ without distorting its semantic identity.
 
 | Constant | Value | Why |
 |----------|-------|-----|
-| `HUE_SIGMA` | 25° | Narrow: only very nearby image hues displace each accent; prevents cross-family bleed |
-| `AFFINITY_SIGMA` | 40° | Wide: captures the warm/cool character of each colour family for chroma scaling |
-| `MAX_HUE_PULL_BASE` | 10° | Hue cap for accents absent from the image (stays near semantic target) |
-| `MAX_HUE_PULL_VIVID` | 25° | Hue cap for image-dominant accents (follows actual image centroid more closely) |
-| `MIN_ACCENT_C` | 0.10 | Floor chroma: every accent is clearly saturated even if not in the image |
-| `MAX_ACCENT_C` | 0.28 | Ceiling chroma: dominant accents in vivid images approach sRGB gamut boundary |
-| `CHROMA_SCALE_REF` | 0.15 | p85 chroma reference: images at or above this get fully vivid dominant accents |
-| `SAMPLE_LIMIT` | 16 384 | Fast analysis of 33MP images; <1% error vs full scan |
+| `FINE_BINS` | 36 | 10° per bin: fine enough to separate adjacent hue families |
+| `SIGNIFICANCE_FACTOR` | 1.5 | Bins must exceed 1.5× uniform weight to count as significant |
+| `MAX_ASSIGNMENT_DISTANCE` | 45° | Peaks further than this from a target don't claim it |
+| `MAX_PEAKS` | 8 | One peak per accent slot maximum |
+| `MIN_ACCENT_C` | 0.10 | Floor for assigned accent chroma (lerp base) |
+| `UNASSIGNED_ACCENT_C` | 0.05 | Chroma for accents with no image peak — muted but identifiable |
+| `MAX_ACCENT_C` | 0.32 | Ceiling for the most dominant image hues |
+| `CHROMA_SCALE_REF` | 0.12 | p85 chroma reference: images at or above this get full C_ceiling |
+| `SAMPLE_LIMIT` | 16 384 | Fast analysis of large images; <1% error vs full scan |
 | `CHROMA_THRESHOLD` | 0.04 | Excludes near-grey pixels from hue statistics |
-| Tone tint C | ≤ 0.012 | Perceptible to the algorithm but below display threshold |
-| Accent L (dark) | 0.65 | WCAG AA contrast (~4.5:1) on base00 (L=0.12) |
+| Tone tint C | ≤ 0.06 | Adaptive ceiling: binary-searched for max contrast-safe value |
+| `MIN_ACCENT_CONTRAST` | 3.0 | Accent contrast against base00/base01 (WCAG AA-large) |
+| `MIN_ACCENT_CONTRAST_BG2` | 2.5 | Accent contrast against base02 (selection highlight) |
+| Accent L (dark) | 0.65 target | Per-accent binary search finds closest L satisfying contrast |
 
 ## Why not just extract colours?
 
@@ -146,29 +171,32 @@ in the image but makes no semantic guarantees. If the image has no blue, you
 get no blue — making code, keywords, and functions invisible in some editors.
 
 Our approach inverts this: we *start* from semantically correct targets and
-*bias* them toward image colours. The result is always usable; it is also
-clearly image-derived, and in most cases "obviously inspired" by the image.
+*assign* image-derived hues where available. The result is always usable; it
+is also clearly image-derived for hues present in the image, and gracefully
+muted for absent hues.
 
 ## Degenerate case analysis
 
 | Input | Result |
 |-------|--------|
-| All-black | Dark mode, tones correct, accents at target hues with min chroma |
-| All-white | Light mode, tones correct, accents at target hues with min chroma |
-| Monochrome (grey gradient) | Dark/light from median L; no hue pull (zero influence); tones tinted at primary_hue bucket midpoint |
-| Random noise | Uniform hue distribution; each bucket pulls equally → near-zero circular mean → no net pull; accents at target hues |
-| Single saturated hue | Full influence, all accents biased up to ±15° toward that hue |
+| All-black | Dark mode, tones correct, all accents unassigned at canonical hues with muted chroma |
+| All-white | Light mode, tones correct, all accents unassigned at canonical hues with muted chroma |
+| Monochrome gradient | Mode from median L; no significant peaks → all accents unassigned |
+| Random noise | Uniform fine histogram → no bins exceed significance threshold → all accents unassigned |
+| Single saturated hue | One peak, one accent assigned with vivid chroma; 7 others muted |
 
 All degenerate cases produce valid, readable themes.
 
 ## Terminal preview
 
 `--preview` writes a two-row ANSI 24-bit colour swatch to stderr (independent
-of the YAML stdout stream) so the palette can be eyeballed without loading
-it into a compositor. Works on any true-colour terminal.
+of the YAML stdout stream). Each swatch label uses a contrasting foreground
+(base07 on dark swatches, base00 on light) for readability.
 
-For deeper validation, feeding the YAML to `stylix` and launching a temporary
-terminal with the applied theme remains the gold standard.
+`--terminal` writes OSC 4/10/11 sequences to stdout to retheme the running
+terminal in-place. Pipe to `/dev/tty`:
+
+    base24-gen --terminal wallpaper.png > /dev/tty
 
 ## File map
 
@@ -176,9 +204,9 @@ terminal with the applied theme remains the gold standard.
 src/
   color.zig     Color math: sRGB ↔ linear ↔ OKLab ↔ OKLCh, gamut clip
   image.zig     stb_image wrapper (PNG/JPEG/BMP/…)
-  analysis.zig  Image profiling (lightness percentiles, hue histogram)
+  analysis.zig  Image profiling (lightness percentiles, hue histograms)
   palette.zig   Palette generation algorithm
-  main.zig      CLI, YAML output, ANSI preview
+  main.zig      CLI, YAML output, ANSI preview, terminal palette
 vendor/
   stb_image.h   Vendored stb_image v2.29 (single-header C library)
   stb_image.c   Implementation unit (defines STB_IMAGE_IMPLEMENTATION)

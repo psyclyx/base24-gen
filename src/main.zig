@@ -213,13 +213,20 @@ fn writePreview(
         }
         try file.writeAll("\x1b[0m\n");
 
-        // Bottom: name on coloured background
+        // Bottom: name on coloured background with contrasting text
+        const fg_light = pal.base07.toHex();
+        const fg_dark = pal.base00.toHex();
         for (row_slots) |slot| {
             const h = slot.srgb.toHex();
             const r = (h >> 16) & 0xFF;
             const g = (h >> 8) & 0xFF;
             const b = h & 0xFF;
-            const cell = try std.fmt.allocPrint(allocator, "\x1b[48;2;{};{};{}m{s}\x1b[0m", .{ r, g, b, slot.name });
+            // Pick light or dark text for readability
+            const fg = if (color.relativeLuminance(slot.srgb) > 0.18) fg_dark else fg_light;
+            const fr = (fg >> 16) & 0xFF;
+            const fgg = (fg >> 8) & 0xFF;
+            const fb = fg & 0xFF;
+            const cell = try std.fmt.allocPrint(allocator, "\x1b[38;2;{};{};{};48;2;{};{};{}m{s}\x1b[0m", .{ fr, fgg, fb, r, g, b, slot.name });
             defer allocator.free(cell);
             try file.writeAll(cell);
         }

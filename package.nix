@@ -1,6 +1,7 @@
 {
   lib,
   stdenv,
+  installShellFiles,
   zig_0_15,
 }:
 
@@ -10,7 +11,10 @@ stdenv.mkDerivation (finalAttrs: {
 
   src = ./.;
 
-  nativeBuildInputs = [ zig_0_15 ];
+  nativeBuildInputs = [
+    zig_0_15
+    installShellFiles
+  ];
 
   # stb_image is vendored; no system libraries required beyond libc.
 
@@ -19,7 +23,11 @@ stdenv.mkDerivation (finalAttrs: {
     zig build --prefix $out -Doptimize=ReleaseSafe
   '';
 
-  installPhase = "true";
+  installPhase = ''
+    installShellCompletion --bash completions/base24-gen.bash
+    installShellCompletion --zsh completions/base24-gen.zsh
+    installShellCompletion --fish completions/base24-gen.fish
+  '';
 
   meta = {
     description = "Deterministic Base24 colour scheme generator from images";

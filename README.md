@@ -6,10 +6,10 @@ Designed as a drop-in replacement for stylix's built-in palette generator with b
 
 ## How it works
 
-1. **Analyze** — sub-sample the image, profile lightness distribution and hue weights across 8 angular buckets in OKLCh color space
-2. **Tone ramp** — build 10 background/foreground shades with subtle tinting from the image's dominant hue
-3. **Accents** — synthesize 8 semantically anchored accent colors (red, orange, yellow, green, cyan, blue, purple, brown), pulling each toward the image's nearby hues proportional to affinity
-4. **Bright variants** — derive 6 brighter accents for terminal bold colors
+1. **Analyze** — sub-sample the image, profile lightness distribution and hue content via coarse (8×45°) and fine (36×10°) histograms in OKLCh
+2. **Tone ramp** — build 10 background/foreground shades with image-derived tinting, contrast-optimized via binary search
+3. **Accents** — extract dominant hue peaks from the fine histogram, assign them to the 8 semantic accent slots (red, orange, yellow, green, cyan, blue, purple, brown) by proximity; assigned slots get image-derived hue at boosted chroma, unassigned slots keep canonical hue at muted chroma
+4. **Bright variants** — derive 6 brighter accents for terminal bold colors, contrast-checked against all background tones
 5. **Gamut clip** — binary search on chroma to bring every color into sRGB
 
 Auto-detects dark/light mode from the image's median lightness. See [DESIGN.md](DESIGN.md) for the full algorithm and rationale.
