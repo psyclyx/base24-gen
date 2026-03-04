@@ -3,7 +3,7 @@
 ## What this is
 
 A deterministic, fast Base24 colour scheme generator. Given an image, it
-produces a `stylix`-compatible YAML palette that is:
+produces a 24-color YAML palette that is:
 
 - **Semantically correct** — red stays reddish, green stays greenish, etc.
 - **Image-inspired** — accent hues and chroma are derived from the image's

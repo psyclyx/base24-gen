@@ -1,8 +1,6 @@
 # base24-gen
 
-Deterministic [Base24](https://github.com/tinted-theming/base24) color scheme generator. Given a wallpaper image, produces a [stylix](https://github.com/danth/stylix)-compatible YAML palette.
-
-Designed as a drop-in replacement for stylix's built-in palette generator with better color semantics.
+Deterministic [Base24](https://github.com/tinted-theming/base24) color scheme generator. Given a wallpaper image, produces a 24-color YAML palette.
 
 ## How it works
 
