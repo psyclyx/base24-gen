@@ -7,7 +7,7 @@
 //!   1. Hue histogram — significant bins and extracted peaks
 //!   2. Hue selection — peak assignment + centroid pull for unassigned
 //!   3. Continuous affinity + ideal (h, C, L) per accent
-//!   4. Constrained L solver (contrast bounds + r/g/b separation, closed-form QP)
+//!   4. Iterative penalty-method optimisation (contrast + diff-pair constraints)
 //!   5. Final palette + metrics
 //!
 //! Navigation:  j/k or up/dn = scroll stages   q = quit
@@ -295,8 +295,7 @@ fn renderStage3(a: std.mem.Allocator, out: std.fs.File, trace: pal_mod.AccentTra
     }
 }
 
-fn renderStage4(a: std.mem.Allocator, out: std.fs.File, trace: pal_mod.AccentTrace, mode: pal_mod.Mode) !void {
-    _ = mode;
+fn renderStage4(a: std.mem.Allocator, out: std.fs.File, trace: pal_mod.AccentTrace, _: pal_mod.Mode) !void {
     {
         const line = try std.fmt.allocPrint(a,
             "  \x1b[2mIterative penalty-method optimisation (coord descent + joint search).\x1b[0m\n" ++

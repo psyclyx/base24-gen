@@ -60,6 +60,7 @@ pub fn build(b: *Build) void {
     for (&[_][]const u8{
         "src/color.zig",
         "src/analysis.zig",
+        "src/peaks.zig",
         "src/palette.zig",
     }) |src| {
         const t = b.addTest(.{

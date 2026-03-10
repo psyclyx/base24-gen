@@ -56,7 +56,9 @@ src/
   color.zig       sRGB/OKLab/OKLCh conversions, gamut clipping, contrast
   image.zig       stb_image wrapper for image loading
   analysis.zig    image profiling (lightness, hue weights, chroma stats)
-  palette.zig     tone ramp, accent synthesis, bright variants
+  peaks.zig       hue peak extraction, image hue sampling
+  palette.zig     tone ramp, accent solver, bright variants
+  devtui.zig      interactive TUI for accent solver visualization
 vendor/
   stb_image.h     vendored stb_image v2.29
 ```

@@ -102,7 +102,7 @@ Eight semantic hue targets in OKLCh:
 | base0E | 328°     | Purple/Magenta |
 | base0F | 55°      | Brown (same hue as orange, lower L and C) |
 
-Accents are generated through a three-stage pipeline:
+Accents are generated through a four-stage pipeline:
 
 **Stage 1 — peak extraction** from the 36-bin fine hue histogram:
 - Bins with weight > 1.5/36 (~0.042) are marked significant
@@ -110,23 +110,56 @@ Accents are generated through a three-stage pipeline:
 - Each cluster yields a peak: circular weighted-mean centroid and summed weight
 - Peaks are sorted by weight (max 8)
 
-**Stage 2 — greedy assignment** of peaks to accent slots:
-- All (peak, slot) pairs within 45° angular distance are candidates
-- Candidates are sorted by distance; each peak and slot are used at most once
-- Slots with no matching peak remain unassigned
+**Stage 2 — exhaustive assignment** of peaks to accent slots:
+- All valid peak-to-slot matchings are enumerated recursively (typically
+  < 100 candidates). A peak is valid for a slot if:
+  - It is within 45° of the slot's canonical hue target
+  - The slot is the closest accent target to the peak's hue (`isClosestSlot`)
+- Each matching is evaluated with a quick 1-round optimisation pass
+- The best-scoring matching proceeds to full evaluation
 
-**Stage 3 — accent synthesis:**
-- **Assigned slots**: hue = peak centroid, chroma = `lerp(0.10, C_ceiling,
-  sqrt(peak_weight / max_peak_weight))`. Image-present hues get vivid chroma
-  proportional to their dominance.
-- **Unassigned slots**: hue = canonical target, chroma = 0.05. Identifiable
-  by hue for syntax highlighting but clearly muted — no phantom saturation
-  for colours absent from the image.
+**Stage 3 — hue + chroma selection:**
+- **Assigned slots**: hue = peak centroid hue
+- **Unassigned slots**: hue pulled toward image data via Gaussian-weighted
+  sampling (σ=30°), limited to preserve hue identity:
+  - Pull capped at ±25° and 40% of nearest-neighbor distance
+  - Pull scaled by evidence strength (image weight / average)
+- **Continuous affinity** (not binary): every accent gets a Gaussian-sampled
+  weight normalised to [0, 1], driving chroma and lightness interpolation
+- **Chroma**: `lerp(floor, C_ceiling, sqrt(affinity))` where floor = 0.10
+  (assigned) or 0.05 (unassigned), C_ceiling from image saturation
+- **Chroma capping** for hue-neighbor pairs (red/orange, orange/brown, etc.):
+  if gamut clipping collapses two accents to < 10° post-clip hue separation,
+  binary-search for the chroma on the lower-affinity accent that gives 15°
 
-Lightness is optimized per-accent via binary search (20 iterations) for the
-L closest to the target (0.65 dark / 0.52 light) that guarantees:
-- ≥ 3.0:1 contrast against base00 and base01
-- ≥ 2.5:1 contrast against base02 (selection highlight)
+**Stage 4 — iterative penalty-method optimisation:**
+
+Parameters: 16 continuous — (L, C) per accent. Hue fixed by matching.
+
+Objective (maximise):
+```
+fidelity(L, C) − λ · violation(L, C)
+
+fidelity  = Σ_i (a_i + ε) · [1 − |L_i − L*_i| / L_range + 0.3 · (1 − |C_i − C*_i| / C_range)]
+violation = Σ bg_contrast_penalties + Σ diff_pair_penalties
+```
+
+Constraints (enforced via quadratic penalty, λ = 500):
+- Background contrast: CR(accent, base00/01) ≥ 3.0:1, CR(accent, base02) ≥ 2.5:1
+- Diff-pair contrast: CR(red, blue) ≥ 2.5:1, CR(green, blue) ≥ 2.5:1
+  (relaxed to 1.5:1 in light mode — blue at 265° is inherently dark in sRGB)
+
+Method: 3 rounds (1 for quick enumeration) of:
+1. **Coordinate descent** — 4 sweeps, each accent gets a 33×9 grid search
+   over [L_lo, L_hi] × [C_floor, C_ideal + 0.03]
+2. **Joint grid search** — 3D search over red/green/blue L values (12 steps
+   early rounds, 24 on final) to resolve coupled diff-pair constraints
+3. **Refinement** (final round only) — ±0.10 L, ±0.02 C fine grid per accent
+
+L search range: [0.45, 0.85] dark, [0.35, 0.70] light.
+
+After optimisation, hard enforcement clamps any remaining bg-contrast violations.
+All evaluation uses post-gamut-clip sRGB, so gamut limits are handled implicitly.
 
 ### 4. Bright variants (base12–17)
 
@@ -162,7 +195,12 @@ without distorting its semantic identity.
 | Tone tint C | ≤ 0.06 | Adaptive ceiling: binary-searched for max contrast-safe value |
 | `MIN_ACCENT_CONTRAST` | 3.0 | Accent contrast against base00/base01 (WCAG AA-large) |
 | `MIN_ACCENT_CONTRAST_BG2` | 2.5 | Accent contrast against base02 (selection highlight) |
-| Accent L (dark) | 0.65 target | Per-accent binary search finds closest L satisfying contrast |
+| `MIN_DIFF_PAIR_CR` | 2.5 (1.5 light) | WCAG contrast between diff-paired accents (red/blue, green/blue) |
+| Accent L range (dark) | [0.45, 0.85] | Feasible L search range for dark-mode accents |
+| Accent L range (light) | [0.35, 0.70] | Feasible L search range for light-mode accents |
+| Accent L target | 0.65 dark / 0.52 light | Ideal L before constraint enforcement |
+| `HUE_SAMPLE_SIGMA` | 30° | Gaussian kernel width for sampling image hue data |
+| `MAX_HUE_PULL` | 25° | Maximum angular shift for unassigned accents toward image centroid |
 
 ## Why not just extract colours?
 
@@ -190,8 +228,9 @@ All degenerate cases produce valid, readable themes.
 ## Terminal preview
 
 `--preview` writes a two-row ANSI 24-bit colour swatch to stderr (independent
-of the YAML stdout stream). Each swatch label uses a contrasting foreground
-(base07 on dark swatches, base00 on light) for readability.
+of the YAML stdout stream). Each swatch label picks whichever of base05 or
+base00 has higher contrast against the swatch colour, ensuring readability
+in both dark and light themes.
 
 `--terminal` writes OSC 4/10/11 sequences to stdout to retheme the running
 terminal in-place. Pipe to `/dev/tty`:
@@ -202,11 +241,13 @@ terminal in-place. Pipe to `/dev/tty`:
 
 ```
 src/
-  color.zig     Color math: sRGB ↔ linear ↔ OKLab ↔ OKLCh, gamut clip
+  color.zig     Color math: sRGB ↔ linear ↔ OKLab ↔ OKLCh, gamut clip, contrast
   image.zig     stb_image wrapper (PNG/JPEG/BMP/…)
   analysis.zig  Image profiling (lightness percentiles, hue histograms)
-  palette.zig   Palette generation algorithm
+  peaks.zig     Hue peak extraction, image hue sampling, accent target definitions
+  palette.zig   Palette generation algorithm (tone ramp, accent solver, bright variants)
   main.zig      CLI, YAML output, ANSI preview, terminal palette
+  devtui.zig    Interactive TUI for step-by-step accent solver visualization
 vendor/
   stb_image.h   Vendored stb_image v2.29 (single-header C library)
   stb_image.c   Implementation unit (defines STB_IMAGE_IMPLEMENTATION)
