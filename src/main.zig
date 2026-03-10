@@ -118,7 +118,7 @@ pub fn main() !void {
     );
 
     // Generate palette
-    const pal = palette.generate(profile, forced_mode);
+    const pal = palette.generate(profile, forced_mode, .{});
 
     const detected_mode: palette.Mode = if (forced_mode) |m| m else
         if (profile.median_lightness < 0.5) .dark else .light;
@@ -213,16 +213,18 @@ fn writePreview(
         }
         try file.writeAll("\x1b[0m\n");
 
-        // Bottom: name on coloured background with contrasting text
-        const fg_light = pal.base07.toHex();
-        const fg_dark = pal.base00.toHex();
+        // Bottom: name on coloured background with contrasting text.
+        // Pick whichever of base05 (text) or base00 (bg) has higher contrast
+        // against the swatch color. This works for both dark and light themes.
         for (row_slots) |slot| {
             const h = slot.srgb.toHex();
             const r = (h >> 16) & 0xFF;
             const g = (h >> 8) & 0xFF;
             const b = h & 0xFF;
-            // Pick light or dark text for readability
-            const fg = if (color.relativeLuminance(slot.srgb) > 0.18) fg_dark else fg_light;
+            const cr_text = color.contrastRatio(slot.srgb, pal.base05);
+            const cr_bg = color.contrastRatio(slot.srgb, pal.base00);
+            const fg_srgb = if (cr_text > cr_bg) pal.base05 else pal.base00;
+            const fg = fg_srgb.toHex();
             const fr = (fg >> 16) & 0xFF;
             const fgg = (fg >> 8) & 0xFF;
             const fb = fg & 0xFF;
