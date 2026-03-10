@@ -39,6 +39,10 @@ pub const ImageProfile = struct {
     fine_hue_weights: [FINE_BINS]f32,
     /// Circular mean hue (degrees) within each fine bin.
     fine_hue_centroids: [FINE_BINS]f32,
+    /// Chroma-weighted mean OKLab L per fine bin (0.5 for empty bins).
+    fine_hue_lightness: [FINE_BINS]f32,
+    /// Chroma-weighted mean chroma per fine bin (0 for empty bins).
+    fine_hue_chroma: [FINE_BINS]f32,
 };
 
 /// Pixels with chroma below this are considered grey/achromatic.
@@ -58,6 +62,8 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
     var fine_weight_acc = [_]f64{0} ** FINE_BINS;
     var fine_sin_acc = [_]f64{0} ** FINE_BINS;
     var fine_cos_acc = [_]f64{0} ** FINE_BINS;
+    var fine_L_acc = [_]f64{0} ** FINE_BINS;
+    var fine_C_acc = [_]f64{0} ** FINE_BINS;
     var chroma_list = try std.ArrayList(f32).initCapacity(allocator, n_samples / 2);
     defer chroma_list.deinit(allocator);
 
@@ -88,6 +94,8 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
             fine_weight_acc[safe_fine] += c64;
             fine_sin_acc[safe_fine] += c64 * sin_h;
             fine_cos_acc[safe_fine] += c64 * cos_h;
+            fine_L_acc[safe_fine] += c64 * @as(f64, lch.L);
+            fine_C_acc[safe_fine] += c64 * c64; // chroma-weighted chroma = C²
 
             try chroma_list.append(allocator, lch.C);
         }
@@ -137,6 +145,9 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
     var fine_hue_weights = [_]f32{0} ** FINE_BINS;
     var fine_hue_centroids = [_]f32{0} ** FINE_BINS;
 
+    var fine_hue_lightness = [_]f32{0.5} ** FINE_BINS;
+    var fine_hue_chroma = [_]f32{0} ** FINE_BINS;
+
     if (fine_total > 0) {
         for (0..FINE_BINS) |bi| {
             fine_hue_weights[bi] = @floatCast(fine_weight_acc[bi] / fine_total);
@@ -146,6 +157,8 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
                     @as(f64, fine_cos_acc[bi]),
                 ) * (180.0 / std.math.pi);
                 fine_hue_centroids[bi] = @floatCast(@mod(angle + 360.0, 360.0));
+                fine_hue_lightness[bi] = @floatCast(fine_L_acc[bi] / fine_weight_acc[bi]);
+                fine_hue_chroma[bi] = @floatCast(fine_C_acc[bi] / fine_weight_acc[bi]);
             } else {
                 fine_hue_centroids[bi] = @as(f32, @floatFromInt(bi)) * 10.0 + 5.0;
             }
@@ -182,6 +195,8 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
         .p85_chroma = p85_chroma,
         .fine_hue_weights = fine_hue_weights,
         .fine_hue_centroids = fine_hue_centroids,
+        .fine_hue_lightness = fine_hue_lightness,
+        .fine_hue_chroma = fine_hue_chroma,
     };
 }
 
