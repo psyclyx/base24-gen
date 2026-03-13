@@ -5,7 +5,6 @@ pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // --- Main executable ---
     const exe = b.addExecutable(.{
         .name = "base24-gen",
         .root_module = b.createModule(.{
@@ -15,7 +14,6 @@ pub fn build(b: *Build) void {
             .link_libc = true,
         }),
     });
-    // stb_image: single vendored C translation unit
     exe.addIncludePath(b.path("vendor"));
     exe.addCSourceFile(.{
         .file = b.path("vendor/stb_image.c"),
@@ -24,7 +22,6 @@ pub fn build(b: *Build) void {
 
     b.installArtifact(exe);
 
-    // --- Dev TUI ---
     const devtui = b.addExecutable(.{
         .name = "devtui",
         .root_module = b.createModule(.{
@@ -41,21 +38,18 @@ pub fn build(b: *Build) void {
     });
     b.installArtifact(devtui);
 
-    // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run base24-gen");
     run_step.dependOn(&run_cmd.step);
 
-    // --- Dev TUI run step ---
     const devtui_run = b.addRunArtifact(devtui);
     devtui_run.step.dependOn(b.getInstallStep());
     if (b.args) |args| devtui_run.addArgs(args);
     const devtui_step = b.step("devtui", "Run palette devtool TUI");
     devtui_step.dependOn(&devtui_run.step);
 
-    // --- Test step ---
     const test_step = b.step("test", "Run unit tests");
     for (&[_][]const u8{
         "src/color.zig",

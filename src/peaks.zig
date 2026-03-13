@@ -29,6 +29,7 @@ pub const HUE_NEIGHBOR_PAIRS = [_][2]usize{
     .{ 0, 7 }, // red (27°)   vs brown  (55°)    — 28° apart
     .{ 1, 7 }, // orange (58°) vs brown  (55°)   —  3° apart
     .{ 1, 2 }, // orange (58°) vs yellow (110°)  — 52° apart
+    .{ 3, 4 }, // green (145°) vs cyan (195°)    — 50° apart
 };
 
 // ─── Accent hue targets ─────────────────────────────────────────────────────
@@ -45,12 +46,12 @@ pub const AccentTarget = struct {
 pub const ACCENT_TARGETS = [8]AccentTarget{
     .{ .h = 27.0 }, // base08 red
     .{ .h = 58.0 }, // base09 orange
-    .{ .h = 110.0 }, // base0A yellow
+    .{ .h = 103.0, .dL = 0.10 }, // base0A yellow (inherently light in OKLCh)
     .{ .h = 145.0 }, // base0B green
     .{ .h = 195.0 }, // base0C cyan
-    .{ .h = 265.0 }, // base0D blue
+    .{ .h = 265.0, .dL = -0.08 }, // base0D blue (inherently dark in sRGB gamut)
     .{ .h = 328.0 }, // base0E purple
-    .{ .h = 55.0, .dL = -0.13, .dC = -0.05 }, // base0F brown (orange hue, dimmer)
+    .{ .h = 55.0, .dL = -0.15, .dC = -0.07 }, // base0F brown (orange hue, dimmer)
 };
 
 // ─── Types ───────────────────────────────────────────────────────────────────

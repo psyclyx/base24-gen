@@ -31,6 +31,8 @@ pub const ImageProfile = struct {
     /// Weighted centroid hue (degrees) within each bucket.
     /// Meaningful only when hue_weights[i] > 0.
     bucket_hues: [8]f32,
+    /// Chroma-weighted mean OKLab L per bucket (0.5 for empty buckets).
+    bucket_mean_L: [8]f32,
     /// Mean chroma of chromatic pixels (C > CHROMA_THRESHOLD).
     mean_chroma: f32,
     /// 85th-percentile chroma — representative of the most vivid pixels.
@@ -59,6 +61,7 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
     var hue_weight_acc = [_]f64{0} ** 8;
     var hue_sin_acc = [_]f64{0} ** 8;
     var hue_cos_acc = [_]f64{0} ** 8;
+    var hue_L_acc = [_]f64{0} ** 8;
     var fine_weight_acc = [_]f64{0} ** FINE_BINS;
     var fine_sin_acc = [_]f64{0} ** FINE_BINS;
     var fine_cos_acc = [_]f64{0} ** FINE_BINS;
@@ -88,6 +91,7 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
             hue_weight_acc[safe_bucket] += c64;
             hue_sin_acc[safe_bucket] += c64 * sin_h;
             hue_cos_acc[safe_bucket] += c64 * cos_h;
+            hue_L_acc[safe_bucket] += c64 * @as(f64, lch.L);
 
             const fine_bin: usize = @intFromFloat(@floor(lch.h / 10.0));
             const safe_fine = fine_bin % FINE_BINS;
@@ -101,44 +105,40 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
         }
     }
 
-    // Lightness percentiles
     const ls = lightness[0..n];
     std.mem.sort(f32, ls, {}, std.sort.asc(f32));
     const median_lightness = ls[n / 2];
     const p10_lightness = ls[n / 10];
     const p90_lightness = ls[(n * 9) / 10];
 
-    // Hue weights (normalised) and bucket centroids
     var hue_total: f64 = 0;
     for (hue_weight_acc) |w| hue_total += w;
 
     var hue_weights = [_]f32{0} ** 8;
     var bucket_hues = [_]f32{0} ** 8;
+    var bucket_mean_L = [_]f32{0.5} ** 8;
 
     if (hue_total > 0) {
         for (0..8) |bi| {
             hue_weights[bi] = @floatCast(hue_weight_acc[bi] / hue_total);
             if (hue_weight_acc[bi] > 0) {
-                // Circular mean within the bucket
                 const angle = std.math.atan2(
                     @as(f64, hue_sin_acc[bi]),
                     @as(f64, hue_cos_acc[bi]),
                 ) * (180.0 / std.math.pi);
                 bucket_hues[bi] = @floatCast(@mod(angle + 360.0, 360.0));
+                bucket_mean_L[bi] = @floatCast(hue_L_acc[bi] / hue_weight_acc[bi]);
             } else {
-                // Empty bucket: use the bucket midpoint
                 bucket_hues[bi] = @as(f32, @floatFromInt(bi)) * 45.0 + 22.5;
             }
         }
     } else {
-        // Monochrome image: uniform hue distribution, midpoints as centroids
         for (0..8) |bi| {
             hue_weights[bi] = 1.0 / 8.0;
             bucket_hues[bi] = @as(f32, @floatFromInt(bi)) * 45.0 + 22.5;
         }
     }
 
-    // Fine hue histogram (36 bins × 10°)
     var fine_total: f64 = 0;
     for (fine_weight_acc) |w| fine_total += w;
 
@@ -164,14 +164,12 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
             }
         }
     } else {
-        // Monochrome image: uniform distribution, midpoints as centroids
         for (0..FINE_BINS) |bi| {
             fine_hue_weights[bi] = 1.0 / @as(f32, @floatFromInt(FINE_BINS));
             fine_hue_centroids[bi] = @as(f32, @floatFromInt(bi)) * 10.0 + 5.0;
         }
     }
 
-    // Chroma statistics
     const cl = chroma_list.items;
     var mean_chroma: f32 = 0;
     var p85_chroma: f32 = 0;
@@ -191,6 +189,7 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
         .p90_lightness = p90_lightness,
         .hue_weights = hue_weights,
         .bucket_hues = bucket_hues,
+        .bucket_mean_L = bucket_mean_L,
         .mean_chroma = mean_chroma,
         .p85_chroma = p85_chroma,
         .fine_hue_weights = fine_hue_weights,
@@ -204,7 +203,6 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
 
 test "pure red image profile" {
     const testing = std.testing;
-    // Synthesise a 10×10 pure-red image
     const pixels = [_][3]u8{.{ 255, 0, 0 }} ** 100;
     const img = image.Image{ .pixels = &pixels, .width = 10, .height = 10 };
 
@@ -213,13 +211,9 @@ test "pure red image profile" {
 
     const profile = try analyze(img, arena.allocator());
 
-    // Red has L around 0.6–0.7 in OKLab
     try testing.expect(profile.median_lightness > 0.5 and profile.median_lightness < 0.8);
-    // Red hue ≈ 27°, so it should land in bucket 0 [0°, 45°)
     try testing.expect(profile.hue_weights[0] > 0.8);
-    // Should have non-trivial chroma
     try testing.expect(profile.mean_chroma > 0.1);
-    // Fine bin 2 [20°, 30°) should capture most red weight
     try testing.expect(profile.fine_hue_weights[2] > 0.5);
 }
 
@@ -233,15 +227,11 @@ test "pure white image profile" {
 
     const profile = try analyze(img, arena.allocator());
 
-    // White is very light
     try testing.expect(profile.median_lightness > 0.9);
-    // No chromatic pixels → monochrome uniform distribution
     try testing.expectApproxEqAbs(0.0, profile.mean_chroma, 1e-4);
-    // Uniform hue weights
     for (profile.hue_weights) |w| {
         try testing.expectApproxEqAbs(1.0 / 8.0, w, 1e-4);
     }
-    // Uniform fine hue weights
     for (profile.fine_hue_weights) |w| {
         try testing.expectApproxEqAbs(1.0 / 36.0, w, 1e-4);
     }

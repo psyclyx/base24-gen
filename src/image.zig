@@ -28,7 +28,6 @@ pub fn load(path: [*:0]const u8) LoadError!Image {
     var height: c_int = 0;
     var channels: c_int = 0;
 
-    // Force 3 channels (RGB); alpha is discarded.
     const data = c.stbi_load(path, &width, &height, &channels, 3) orelse
         return LoadError.ImageLoadFailed;
 

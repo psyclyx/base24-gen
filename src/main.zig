@@ -91,10 +91,8 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Derive default scheme name from filename stem
     const name = scheme_name orelse stemOf(img_path);
 
-    // Load image
     const img_path_z = try allocator.dupeZ(u8, img_path);
     defer allocator.free(img_path_z);
 
@@ -106,7 +104,6 @@ pub fn main() !void {
 
     log.info("Loaded {s} ({}×{})", .{ img_path, img.width, img.height });
 
-    // Analyse
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
@@ -117,7 +114,6 @@ pub fn main() !void {
         .{ profile.median_lightness, profile.mean_chroma, profile.p85_chroma },
     );
 
-    // Generate palette
     const pal = palette.generate(profile, forced_mode, .{});
 
     const detected_mode: palette.Mode = if (forced_mode) |m| m else
@@ -125,9 +121,8 @@ pub fn main() !void {
 
     log.info("Mode: {s}", .{@tagName(detected_mode)});
 
-    // Output YAML — to --output file if given, else stdout.
-    // When --terminal is active and no --output is given, skip stdout YAML
-    // so the caller can pipe terminal sequences cleanly: cmd > /dev/tty
+    // When --terminal without --output, skip stdout YAML so the caller
+    // can pipe terminal sequences cleanly: base24-gen --terminal img > /dev/tty
     if (output_path) |path| {
         const file = std.fs.cwd().createFile(path, .{}) catch |err| {
             log.err("Cannot open output '{s}': {}", .{ path, err });
@@ -139,13 +134,10 @@ pub fn main() !void {
         try writeYaml(std.fs.File.stdout(), allocator, name, author, &pal);
     }
 
-    // Optional ANSI preview to stderr
     if (preview) {
         try writePreview(std.fs.File.stderr(), allocator, &pal);
     }
 
-    // Optional: write OSC 4/10/11 sequences to stdout.
-    // Typical use: base24-gen --terminal img.png > /dev/tty
     if (terminal) {
         try writeTerminalPalette(std.fs.File.stdout(), allocator, &pal);
     }
@@ -182,9 +174,6 @@ fn writeYaml(
 }
 
 // ─── ANSI preview ────────────────────────────────────────────────────────────
-//
-// Prints a two-row colour swatch per group: background on top, label below.
-// Works on any true-colour terminal.
 
 fn writePreview(
     file: std.fs.File,
@@ -195,13 +184,11 @@ fn writePreview(
 
     const slots = pal.slots();
 
-    // Two rows of 12
     for (0..2) |row| {
         const start = row * 12;
         const end = @min(start + 12, slots.len);
         const row_slots = slots[start..end];
 
-        // Top: colour block
         for (row_slots) |slot| {
             const h = slot.srgb.toHex();
             const r = (h >> 16) & 0xFF;
@@ -213,9 +200,7 @@ fn writePreview(
         }
         try file.writeAll("\x1b[0m\n");
 
-        // Bottom: name on coloured background with contrasting text.
-        // Pick whichever of base05 (text) or base00 (bg) has higher contrast
-        // against the swatch color. This works for both dark and light themes.
+        // Label with whichever of base05/base00 has higher contrast
         for (row_slots) |slot| {
             const h = slot.srgb.toHex();
             const r = (h >> 16) & 0xFF;
@@ -237,29 +222,6 @@ fn writePreview(
 }
 
 // ─── Terminal palette injection ───────────────────────────────────────────────
-//
-// Writes OSC 4 sequences to set the 16 ANSI palette colours and OSC 10/11
-// for default foreground/background. Pipe to /dev/tty to apply:
-//
-//   base24-gen --terminal img.png > /dev/tty
-//
-// Base24 → ANSI 16 colour mapping follows the conventional terminal assignment:
-//   0 black        base00  (default background)
-//   1 red          base08
-//   2 green        base0B
-//   3 yellow       base0A
-//   4 blue         base0D
-//   5 magenta      base0E
-//   6 cyan         base0C
-//   7 white        base05  (default foreground)
-//   8 bright black base03  (comments)
-//   9 bright red   base12
-//  10 bright green base14
-//  11 bright yellow base13
-//  12 bright blue  base16
-//  13 bright magenta base17
-//  14 bright cyan  base15
-//  15 bright white base07
 
 fn writeTerminalPalette(
     file: std.fs.File,
@@ -284,7 +246,6 @@ fn writeTerminalPalette(
         try file.writeAll(seq);
     }
 
-    // Default foreground (base05) and background (base00)
     const fg_seq = try std.fmt.allocPrint(
         allocator,
         "\x1b]10;#{x:0>6}\x1b\\",
