@@ -134,6 +134,16 @@ pub fn sampleHueData(profile: analysis.ImageProfile, hue: f32) HueData {
 
 // ─── Slot assignment helpers ─────────────────────────────────────────────────
 
+/// True if a peak fits base0F's identity: dim and desaturated, the way
+/// brown looks regardless of where in the orange/brown hue range it sits.
+/// Lets brown claim a brown-tone cluster that's strictly inside orange's
+/// hue territory — without this, such clusters get wasted (orange may
+/// claim a brighter peak from elsewhere, leaving the brown-tone one
+/// unassigned).
+pub fn brownLike(p: Peak) bool {
+    return p.L < 0.55 and p.C < 0.15;
+}
+
 /// Returns true if `slot` is the closest accent target to the given `hue`.
 /// Ties go to the first slot (lower index).
 pub fn isClosestSlot(slot: usize, hue: f32) bool {

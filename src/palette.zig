@@ -26,6 +26,7 @@ const HueData = pks.HueData;
 const extractPeaks = pks.extractPeaks;
 const sampleHueData = pks.sampleHueData;
 const isClosestSlot = pks.isClosestSlot;
+const brownLike = pks.brownLike;
 const nearestNeighborDist = pks.nearestNeighborDist;
 const MAX_PEAKS = pks.MAX_PEAKS;
 const MAX_ASSIGNMENT_DISTANCE = pks.MAX_ASSIGNMENT_DISTANCE;
@@ -426,7 +427,16 @@ fn collectRec(ctx: *CollectCtx, slot: usize, current: *[8]?usize, peak_used: *[M
         if (peak_used[pi]) continue;
         const dist = @abs(color.angularDiff(p.hue, ACCENT_TARGETS[slot].h));
         if (dist > MAX_ASSIGNMENT_DISTANCE) continue;
-        if (!isClosestSlot(slot, p.hue)) continue;
+        // Brown is allowed to claim any brown-like peak in its hue range,
+        // not just those strictly closest to brown — so a dim cluster at
+        // orange's hue isn't wasted. The matching enumerator scores both
+        // "brown takes it / orange unassigned" and "orange takes it /
+        // brown unassigned" and the best wins.
+        const can_claim = if (slot == 7)
+            brownLike(p)
+        else
+            isClosestSlot(slot, p.hue);
+        if (!can_claim) continue;
         current[slot] = pi;
         peak_used[pi] = true;
         collectRec(ctx, slot + 1, current, peak_used);
