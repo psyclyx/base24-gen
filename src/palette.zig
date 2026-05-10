@@ -140,6 +140,12 @@ const TINT_C_CEILING: f32 = 0.04;
 /// Applied to unassigned accent slots only, scaled by mean_hue_strength,
 /// so all accents share a hint of the image's overall temperature.
 const TEMPERATURE_PULL: f32 = 5.0;
+/// Maximum L spread across accents before the harmony soft penalty kicks
+/// in. = max(dL) − min(dL) + 0.10 = 0.10 − (−0.15) + 0.10 = 0.35. The
+/// first 0.25 is the intentional baseline from yellow's lift and brown's
+/// drop; the +0.10 is image-induced variance we tolerate before pulling
+/// accents back into a shared L band.
+const ALLOWED_L_SPREAD: f32 = 0.35;
 
 /// Minimum contrast ratio for accents against base02 (selection highlight).
 const MIN_ACCENT_CONTRAST_BG2: f32 = 2.5;
@@ -771,6 +777,19 @@ fn evaluateMatching(
                                 joint_soft += sq(config.min_cvd_de - cvd_de);
                         }
 
+                        // L-spread harmony penalty over the full palette.
+                        var min_L: f32 = @min(@min(lch_r.L, lch_g.L), lch_b.L);
+                        var max_L: f32 = @max(@max(lch_r.L, lch_g.L), lch_b.L);
+                        for (cur_srgb, 0..) |s, k| {
+                            if (k == ri or k == gi or k == bi) continue;
+                            const Lk = color.srgbToLch(s).L;
+                            if (Lk < min_L) min_L = Lk;
+                            if (Lk > max_L) max_L = Lk;
+                        }
+                        const L_spread = max_L - min_L;
+                        if (L_spread > ALLOWED_L_SPREAD)
+                            joint_soft += sq(L_spread - ALLOWED_L_SPREAD);
+
                         const obj: f32 = if (joint_violation > 1e-6)
                             -1000.0 - penalty_weight * joint_violation
                         else
@@ -988,6 +1007,22 @@ fn evalAccentContribution(
         if (cvd_de < config.min_cvd_de) {
             soft_penalty += sq(config.min_cvd_de - cvd_de);
         }
+    }
+
+    // L-spread harmony penalty: a vivid image can pull individual accents
+    // to wildly different L values; this reins them back into a shared
+    // band so the palette feels intentional rather than scattered.
+    var min_other_L: f32 = std.math.floatMax(f32);
+    var max_other_L: f32 = -std.math.floatMax(f32);
+    for (all_srgb, 0..) |s, j| {
+        if (j == i) continue;
+        const Lj = color.srgbToLch(s).L;
+        if (Lj < min_other_L) min_other_L = Lj;
+        if (Lj > max_other_L) max_other_L = Lj;
+    }
+    const L_spread = @max(max_other_L, actual_lch.L) - @min(min_other_L, actual_lch.L);
+    if (L_spread > ALLOWED_L_SPREAD) {
+        soft_penalty += sq(L_spread - ALLOWED_L_SPREAD);
     }
 
     if (violation > 1e-6) {
