@@ -110,8 +110,8 @@ pub fn main() !void {
     const profile = try analysis.analyze(img, arena.allocator());
 
     log.info(
-        "Profile: median_L={d:.3} mean_C={d:.3} p85_C={d:.3}",
-        .{ profile.median_lightness, profile.mean_chroma, profile.p85_chroma },
+        "Profile: median_L={d:.3} chroma_lower={d:.3} chroma_upper={d:.3} clusters={d}",
+        .{ profile.median_lightness, profile.chroma_lower, profile.chroma_upper, profile.n_clusters },
     );
 
     const pal = palette.generate(profile, forced_mode, .{});

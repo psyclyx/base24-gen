@@ -122,11 +122,24 @@ const LIGHT_TONE_L = [10]f32{
 const BRIGHT_DL: f32 = 0.10;
 const BRIGHT_DC: f32 = 0.03;
 
-const MIN_ACCENT_C: f32 = 0.10;
-const UNASSIGNED_ACCENT_C: f32 = 0.07;
+/// Hard floor for peak-assigned accent C (kept low so muted images can yield
+/// muted accents; the actual ceiling is image-derived).
+const MIN_ACCENT_C: f32 = 0.07;
+/// Hard floor for unassigned accent C — must be visible as colour, not gray.
+const UNASSIGNED_ACCENT_C: f32 = 0.05;
+/// Hard ceiling for accent C; the image-derived target is clamped here.
 const MAX_ACCENT_C: f32 = 0.32;
 
-const CHROMA_SCALE_REF: f32 = 0.12;
+/// 1.2× headroom above the image's vivid-cluster mean, so accents read as
+/// semantic focal points rather than blending in with the rest of the image.
+const ACCENT_BOOST: f32 = 1.2;
+/// Hard cap on neutral chroma floor regardless of how tinted the image is —
+/// past this point the bases stop reading as neutrals.
+const TINT_C_CEILING: f32 = 0.04;
+/// Maximum hue shift (degrees) toward the image's circular-mean hue.
+/// Applied to unassigned accent slots only, scaled by mean_hue_strength,
+/// so all accents share a hint of the image's overall temperature.
+const TEMPERATURE_PULL: f32 = 5.0;
 
 /// Minimum contrast ratio for accents against base02 (selection highlight).
 const MIN_ACCENT_CONTRAST_BG2: f32 = 2.5;
@@ -265,7 +278,14 @@ pub fn metrics(profile: analysis.ImageProfile, forced_mode: ?Mode, config: Confi
 pub const AccentTrace = struct {
     // Image analysis inputs
     overall_scale: f32,
+    /// Image-derived absolute chroma target (chroma_upper × ACCENT_BOOST,
+    /// clamped to [MIN_ACCENT_C, MAX_ACCENT_C]). The "vibrance" of the theme.
     c_ceiling: f32,
+    /// Per-accent harmonized chroma ceiling — same fraction of each accent's
+    /// gamut max, so all accents share visual weight.
+    c_ceiling_per: [8]f32,
+    /// The shared fraction of gamut max used for harmonization.
+    sat_fraction: f32,
 
     // Stage 1: peak extraction
     peaks: [MAX_PEAKS]Peak,
@@ -315,6 +335,8 @@ pub fn traceAccents(profile: analysis.ImageProfile, forced_mode: ?Mode, config: 
     return .{
         .overall_scale = sol.overall_scale,
         .c_ceiling = sol.c_ceiling,
+        .c_ceiling_per = sol.c_ceiling_per,
+        .sat_fraction = sol.sat_fraction,
         .peaks = sol.peaks,
         .n_peaks = sol.n_peaks,
         .sig_threshold = sig_threshold,
@@ -350,7 +372,7 @@ fn buildToneRamp(profile: analysis.ImageProfile, mode: Mode) [10]color.Srgb {
     const primary = dominantBucket(profile.hue_weights);
     const split = splitToneHues(profile, primary);
 
-    const tint_C_max = @min(@max(profile.mean_chroma * 0.5, profile.p85_chroma * 0.35), 0.06);
+    const tint_C_max = @min(profile.chroma_lower, TINT_C_CEILING);
 
     var lo: f32 = 0.0;
     var hi: f32 = tint_C_max;
@@ -379,8 +401,11 @@ fn buildToneRamp(profile: analysis.ImageProfile, mode: Mode) [10]color.Srgb {
 }
 
 fn tintChromaForL(base_C: f32, dark_L: f32, tint_h: f32) f32 {
+    // σ=0.45 keeps a visible hint of tint at the L extremes (base11/base07)
+    // instead of crushing chroma to ~0. Catppuccin's crust still reads as
+    // purple-ish; with a narrower bell ours reverted to pure neutral.
     const center: f32 = 0.40;
-    const sigma: f32 = 0.30;
+    const sigma: f32 = 0.45;
     const t = (dark_L - center) / sigma;
     const envelope = std.math.exp(-0.5 * t * t);
     const gamut_max = color.maxGamutChroma(dark_L, tint_h);
@@ -426,7 +451,9 @@ const SolverResult = struct {
     n_matchings_tried: usize,
     best_score: f32,
     overall_scale: f32,
-    c_ceiling: f32,
+    c_ceiling: f32, // image-derived absolute target
+    c_ceiling_per: [8]f32, // per-accent harmonized ceiling
+    sat_fraction: f32,
     accent_L_base: f32,
     L_lo: f32,
     L_hi: f32,
@@ -436,8 +463,34 @@ fn solveAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srg
     const accent_L_base: f32 = if (mode == .dark) config.accent_l_dark else config.accent_l_light;
     const L_lo: f32 = if (mode == .dark) 0.45 else 0.35;
     const L_hi: f32 = if (mode == .dark) 0.85 else 0.70;
-    const overall_scale = color.saturate(profile.p85_chroma / CHROMA_SCALE_REF);
-    const C_ceiling = color.lerp(MIN_ACCENT_C, MAX_ACCENT_C, overall_scale);
+
+    // Image-derived absolute vibrance target.
+    const C_target_abs = std.math.clamp(profile.chroma_upper * ACCENT_BOOST, MIN_ACCENT_C, MAX_ACCENT_C);
+
+    // Pre-compute per-accent gamut maxes at accent_L_base + dL. Harmonization
+    // applies the same fraction of gamut max to every accent — so yellow
+    // (high-gamut) and green (low-gamut) sit at the same perceptual saturation
+    // instead of yellow dominating because it has more gamut headroom.
+    var gamut_max_arr: [8]f32 = undefined;
+    var max_gamut: f32 = 0;
+    for (ACCENT_TARGETS, 0..) |target, i| {
+        const test_L = std.math.clamp(accent_L_base + target.dL, L_lo, L_hi);
+        gamut_max_arr[i] = color.maxGamutChroma(test_L, target.h);
+        if (gamut_max_arr[i] > max_gamut) max_gamut = gamut_max_arr[i];
+    }
+
+    // Calibrate the fraction against the LARGEST accent gamut: the most-
+    // saturable hue lands at C_target_abs at most, and lower-gamut hues
+    // scale down proportionally to maintain harmony. This keeps the palette
+    // restrained — no accent ever exceeds the image's absolute vibrance.
+    const sat_fraction = std.math.clamp(C_target_abs / max_gamut, 0.35, 0.92);
+
+    var c_ceiling: [8]f32 = undefined;
+    for (0..8) |i| {
+        c_ceiling[i] = @max(MIN_ACCENT_C, gamut_max_arr[i] * sat_fraction);
+    }
+
+    const overall_scale = (C_target_abs - MIN_ACCENT_C) / (MAX_ACCENT_C - MIN_ACCENT_C);
 
     var effective_config = config;
     if (mode == .light) {
@@ -464,22 +517,22 @@ fn solveAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srg
         var pool: std.Thread.Pool = undefined;
         pool.init(.{ .allocator = std.heap.page_allocator }) catch {
             for (0..n_matchings) |i| {
-                evalMatchingTask(&scores, i, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, C_ceiling, accent_L_base, L_lo, L_hi);
+                evalMatchingTask(&scores, i, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, c_ceiling, accent_L_base, L_lo, L_hi);
             }
-            return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, C_ceiling, accent_L_base, overall_scale, L_lo, L_hi);
+            return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, c_ceiling, C_target_abs, sat_fraction, accent_L_base, overall_scale, L_lo, L_hi);
         };
         defer pool.deinit();
 
         var wg: std.Thread.WaitGroup = .{};
         for (0..n_matchings) |i| {
-            pool.spawnWg(&wg, evalMatchingTask, .{ &scores, i, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, C_ceiling, accent_L_base, L_lo, L_hi });
+            pool.spawnWg(&wg, evalMatchingTask, .{ &scores, i, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, c_ceiling, accent_L_base, L_lo, L_hi });
         }
         pool.waitAndWork(&wg);
     } else if (n_matchings == 1) {
-        evalMatchingTask(&scores, 0, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, C_ceiling, accent_L_base, L_lo, L_hi);
+        evalMatchingTask(&scores, 0, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, c_ceiling, accent_L_base, L_lo, L_hi);
     }
 
-    return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, C_ceiling, accent_L_base, overall_scale, L_lo, L_hi);
+    return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, c_ceiling, C_target_abs, sat_fraction, accent_L_base, overall_scale, L_lo, L_hi);
 }
 
 fn finishSolve(
@@ -492,7 +545,9 @@ fn finishSolve(
     mode: Mode,
     config: Config,
     tones: [10]color.Srgb,
-    C_ceiling: f32,
+    c_ceiling: [8]f32,
+    c_target_abs: f32,
+    sat_fraction: f32,
     accent_L_base: f32,
     overall_scale: f32,
     L_lo: f32,
@@ -509,7 +564,7 @@ fn finishSolve(
 
     const best_matching = if (n_matchings > 0) matchings[best_idx] else [_]?usize{null} ** 8;
 
-    const eval = evaluateMatching(best_matching, peaks[0..n_peaks], profile, mode, config, tones, C_ceiling, accent_L_base, L_lo, L_hi, true);
+    const eval = evaluateMatching(best_matching, peaks[0..n_peaks], profile, mode, config, tones, c_ceiling, accent_L_base, L_lo, L_hi, true);
 
     return .{
         .result = eval.result,
@@ -526,7 +581,9 @@ fn finishSolve(
         .n_matchings_tried = n_matchings,
         .best_score = best_score,
         .overall_scale = overall_scale,
-        .c_ceiling = C_ceiling,
+        .c_ceiling = c_target_abs,
+        .c_ceiling_per = c_ceiling,
+        .sat_fraction = sat_fraction,
         .accent_L_base = accent_L_base,
         .L_lo = L_lo,
         .L_hi = L_hi,
@@ -576,7 +633,7 @@ fn evalMatchingTask(
     mode: Mode,
     config: Config,
     tones: [10]color.Srgb,
-    c_ceiling: f32,
+    c_ceiling: [8]f32,
     accent_L_base: f32,
     L_lo: f32,
     L_hi: f32,
@@ -606,7 +663,7 @@ fn evaluateMatching(
     mode: Mode,
     config: Config,
     tones: [10]color.Srgb,
-    c_ceiling: f32,
+    c_ceiling: [8]f32,
     accent_L_base: f32,
     L_lo: f32,
     L_hi: f32,
@@ -623,7 +680,9 @@ fn evaluateMatching(
         if (matching[i]) |peak_idx| {
             accent_h[i] = peaks[peak_idx].hue;
         } else {
+            // Local pull: toward whatever image data exists near this slot.
             const sample = sampleHueData(profile, target.h);
+            var h: f32 = target.h;
             if (sample.weight > 1e-6) {
                 const max_pull = @min(MAX_HUE_PULL, nearestNeighborDist(i) * 0.4);
                 const avg_weight: f32 = 1.0 / @as(f32, @floatFromInt(analysis.FINE_BINS));
@@ -633,15 +692,37 @@ fn evaluateMatching(
                     -max_pull,
                     max_pull,
                 );
-                const pull = raw_pull * evidence;
-                accent_h[i] = @mod(target.h + pull + 360.0, 360.0);
-            } else {
-                accent_h[i] = target.h;
+                h = @mod(target.h + raw_pull * evidence + 360.0, 360.0);
             }
+            // Global pull: small bias toward the image's overall temperature,
+            // scaled by how concentrated the hue distribution is.
+            const temp_max = TEMPERATURE_PULL * profile.mean_hue_strength;
+            const temp_pull = std.math.clamp(
+                color.angularDiff(profile.mean_hue, h),
+                -temp_max,
+                temp_max,
+            );
+            accent_h[i] = @mod(h + temp_pull + 360.0, 360.0);
         }
     }
 
+    // For peak-assigned slots backed by a 3D cluster, use the cluster's
+    // (L, C, weight) directly — this is the actual colour the image has at
+    // that hue, not a Gaussian-band average. Histogram-derived peaks and
+    // unassigned slots fall back to sampleHueData.
     for (0..8) |i| {
+        if (matching[i]) |peak_idx| {
+            const p = peaks[peak_idx];
+            if (p.hasLabData()) {
+                img_data[i] = .{
+                    .L = p.L,
+                    .C = p.C,
+                    .weight = p.weight,
+                    .centroid_h = p.hue,
+                };
+                continue;
+            }
+        }
         img_data[i] = sampleHueData(profile, accent_h[i]);
     }
 
@@ -666,7 +747,7 @@ fn evaluateMatching(
             color.maxGamutChroma(ideal_L[i], accent_h[i]),
             color.maxGamutChroma(accent_L_base, accent_h[i]),
         );
-        const raw_C = @max(0.0, color.lerp(C_floor, c_ceiling, @sqrt(affinity[i])) + target.dC);
+        const raw_C = @max(0.0, color.lerp(C_floor, c_ceiling[i], @sqrt(affinity[i])) + target.dC);
         accent_C[i] = @min(raw_C, gamut_max);
     }
 
@@ -718,7 +799,7 @@ fn evaluateMatching(
     for (0..8) |i| {
         const C_floor: f32 = if (matching[i] != null) MIN_ACCENT_C else UNASSIGNED_ACCENT_C;
         c_lo[i] = C_floor;
-        c_hi[i] = @min(c_ceiling, accent_C[i] + 0.03);
+        c_hi[i] = @min(c_ceiling[i], accent_C[i] + 0.03);
     }
 
     const INDEPENDENT = [_]usize{ 1, 2, 4, 6, 7 }; // orange, yellow, cyan, purple, brown
@@ -742,7 +823,7 @@ fn evaluateMatching(
             var ci: usize = 0;
             while (ci <= c_steps) : (ci += 1) {
                 const trial_C = color.lerp(c_lo[i], c_hi[i], @as(f32, @floatFromInt(ci)) / @as(f32, @floatFromInt(c_steps)));
-                const obj = evalAccentContribution(i, trial_L, trial_C, &accent_h, &cur_srgb, &affinity, &ideal_L, &accent_C, base00, base01, base02, L_lo, L_hi, c_ceiling, penalty_weight, config);
+                const obj = evalAccentContribution(i, trial_L, trial_C, &accent_h, &cur_srgb, &affinity, &ideal_L, &accent_C, base00, base01, base02, L_lo, L_hi, c_ceiling[i], penalty_weight, config);
                 if (obj > best_obj) {
                     best_obj = obj;
                     best_L = trial_L;
@@ -777,7 +858,7 @@ fn evaluateMatching(
                     while (ci <= c_steps) : (ci += 1) {
                         const trial_C = color.lerp(c_lo[i], c_hi[i], @as(f32, @floatFromInt(ci)) / @as(f32, @floatFromInt(c_steps)));
 
-                        const obj = evalAccentContribution(i, trial_L, trial_C, &accent_h, &cur_srgb, &affinity, &ideal_L, &accent_C, base00, base01, base02, L_lo, L_hi, c_ceiling, penalty_weight, config);
+                        const obj = evalAccentContribution(i, trial_L, trial_C, &accent_h, &cur_srgb, &affinity, &ideal_L, &accent_C, base00, base01, base02, L_lo, L_hi, c_ceiling[i], penalty_weight, config);
 
                         if (obj > best_obj) {
                             best_obj = obj;
@@ -940,7 +1021,7 @@ fn evaluateMatching(
                     var ci: usize = 0;
                     while (ci <= 8) : (ci += 1) {
                         const trial_C = color.lerp(c_search_lo, c_search_hi, @as(f32, @floatFromInt(ci)) / 8.0);
-                        const obj = evalAccentContribution(i, trial_L, trial_C, &accent_h, &cur_srgb, &affinity, &ideal_L, &accent_C, base00, base01, base02, L_lo, L_hi, c_ceiling, penalty_weight, config);
+                        const obj = evalAccentContribution(i, trial_L, trial_C, &accent_h, &cur_srgb, &affinity, &ideal_L, &accent_C, base00, base01, base02, L_lo, L_hi, c_ceiling[i], penalty_weight, config);
                         if (obj > best_obj) {
                             best_obj = obj;
                             best_L = trial_L;
@@ -1007,6 +1088,19 @@ fn evaluateMatching(
                 param_L[move_idx] = candidate_L;
                 break;
             }
+        }
+    }
+
+    // Hue identity guarantee: each accent must remain within its semantic
+    // band of its canonical target. Stacked pulls (peak + temperature) are
+    // bounded by MAX_HUE_PULL and TEMPERATURE_PULL, and peak assignment is
+    // gated by MAX_ASSIGNMENT_DISTANCE — so this assert should never fire.
+    // It catches future regressions where new pulls or solver moves drift
+    // an accent out of its band.
+    if (std.debug.runtime_safety) {
+        for (ACCENT_TARGETS, 0..) |target, i| {
+            const dist = @abs(color.angularDiff(accent_h[i], target.h));
+            std.debug.assert(dist <= MAX_ASSIGNMENT_DISTANCE);
         }
     }
 
@@ -1303,8 +1397,10 @@ test "degenerate: all-black image produces usable dark palette" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.0,
-        .p85_chroma = 0.0,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.0,
+        .chroma_upper = 0.0,
         .fine_hue_weights = uniform_fine_weights,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1343,8 +1439,10 @@ test "degenerate: pure white image produces light palette" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.0,
-        .p85_chroma = 0.0,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.0,
+        .chroma_upper = 0.0,
         .fine_hue_weights = uniform_fine_weights,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1377,8 +1475,10 @@ test "hue semantics: red should land near red hue" {
         .hue_weights = weights,
         .bucket_hues = hues,
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.15,
-        .p85_chroma = 0.20,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.04,
+        .chroma_upper = 0.20,
         .fine_hue_weights = fine_w,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1404,8 +1504,10 @@ test "bright variants are lighter than their base" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.10,
-        .p85_chroma = 0.15,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.03,
+        .chroma_upper = 0.15,
         .fine_hue_weights = uniform_fine_weights,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1442,12 +1544,14 @@ test "contrast: primary text (base05 on base00) meets AAA" {
                 break :blk h;
             },
             .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.18,
-            .p85_chroma = 0.25,
+            .mean_hue = 0,
+            .mean_hue_strength = 0,
+            .chroma_lower = 0.05,
+            .chroma_upper = 0.25,
             .fine_hue_weights = vivid_fine.w,
             .fine_hue_centroids = vivid_fine.c,
             .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
+            .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
         },
         // All-black degenerate
         .{
@@ -1461,8 +1565,10 @@ test "contrast: primary text (base05 on base00) meets AAA" {
                 break :blk h;
             },
             .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.0,
-            .p85_chroma = 0.0,
+            .mean_hue = 0,
+            .mean_hue_strength = 0,
+            .chroma_lower = 0.0,
+            .chroma_upper = 0.0,
             .fine_hue_weights = uniform_fine_weights,
             .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1501,8 +1607,10 @@ test "contrast: all accents meet minimum contrast against base00 and base02" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.15,
-        .p85_chroma = 0.20,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.04,
+        .chroma_upper = 0.20,
         .fine_hue_weights = accent_fine.w,
         .fine_hue_centroids = accent_fine.c,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1551,8 +1659,10 @@ test "tint visibility: vivid image produces tint above old ceiling" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.20,
-        .p85_chroma = 0.28,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.05,
+        .chroma_upper = 0.28,
         .fine_hue_weights = tint_fine.w,
         .fine_hue_centroids = tint_fine.c,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1578,8 +1688,10 @@ test "degenerate: all-black produces zero tint" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.0,
-        .p85_chroma = 0.0,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.0,
+        .chroma_upper = 0.0,
         .fine_hue_weights = uniform_fine_weights,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1619,8 +1731,10 @@ test "diff-pair contrast: red and green are distinct from blue" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.15,
-        .p85_chroma = 0.22,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.05,
+        .chroma_upper = 0.22,
         .fine_hue_weights = fine_w,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1666,8 +1780,10 @@ test "hue identity: each accent stays within its semantic range" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.18,
-        .p85_chroma = 0.25,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.05,
+        .chroma_upper = 0.25,
         .fine_hue_weights = fine_w,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
@@ -1725,8 +1841,10 @@ test "light mode accents are not too dark" {
             break :blk h;
         },
         .bucket_mean_L = .{0.5} ** 8,
-        .mean_chroma = 0.15,
-        .p85_chroma = 0.22,
+        .mean_hue = 0,
+        .mean_hue_strength = 0,
+        .chroma_lower = 0.05,
+        .chroma_upper = 0.22,
         .fine_hue_weights = fine_w,
         .fine_hue_centroids = uniform_fine_centroids,
         .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,

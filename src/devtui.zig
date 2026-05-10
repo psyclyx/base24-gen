@@ -243,8 +243,8 @@ fn renderStage1(a: std.mem.Allocator, out: std.fs.File, profile: analysis.ImageP
     }
     {
         const line = try std.fmt.allocPrint(a,
-            "\n  overall_scale: {d:.3}  C_ceiling: {d:.3}\n",
-            .{ trace.overall_scale, trace.c_ceiling },
+            "\n  overall_scale: {d:.3}  C_target: {d:.3}  sat_fraction: {d:.3}\n",
+            .{ trace.overall_scale, trace.c_ceiling, trace.sat_fraction },
         );
         defer a.free(line);
         try out.writeAll(line);

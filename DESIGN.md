@@ -49,7 +49,13 @@ Output (`ImageProfile`):
 - `hue_weights[8]`, `bucket_hues[8]`: coarse histogram (used for tone tinting)
 - `fine_hue_weights[36]`, `fine_hue_centroids[36]`: fine histogram (used for
   accent peak extraction)
-- `mean_chroma`, `p85_chroma`: overall and peak saturation of the image
+- `chroma_lower`, `chroma_upper`: 1D k-means (k=2) cluster means over the
+  per-pixel chroma distribution. The lower mean is the natural chroma of the
+  image's quiet regions (drives base tint); the upper mean is the chroma of
+  the vivid regions (drives accent ceiling). When the distribution is
+  unimodal — monochrome, B&W, noise, or any image without a clear
+  saturated/quiet split — both collapse to the joint mean, which yields a
+  uniform-vibrance theme without artificial popping.
 
 ### 2. Tone ramp generation (`palette.zig`)
 
@@ -81,11 +87,12 @@ Falls back to single-hue tinting when the two hues are < 30° apart or the
 secondary bucket has < 15% of the primary's weight.
 
 A **bell-shaped chroma envelope** scales tint chroma per tone: peak at
-mid-tones (L≈0.4) where the sRGB gamut is widest, tapering at dark/light
-extremes where the gamut is tiny and tint would be invisible. The envelope
-peak is `min(max(mean_chroma × 0.5, p85_chroma × 0.35), 0.06)`, then
-binary-searched (20 iterations) to find the highest value that satisfies
-all required contrast pairs.
+mid-tones (L≈0.4) where the sRGB gamut is widest, with σ=0.45 so a hint
+of tint stays visible at the L extremes (base11/base07) instead of being
+crushed to ~0. The envelope peak is `min(chroma_lower, 0.04)` — the
+natural chroma of the image's quiet regions, capped so it never
+overwhelms the bases — then binary-searched (20 iterations) to find the
+highest value that still satisfies all required contrast pairs.
 
 **Enforced contrast pairs:**
 - base05 on base00 ≥ 7.0:1 (primary text, WCAG AAA)
@@ -139,8 +146,19 @@ Accents are generated through a four-stage pipeline:
   - Pull scaled by evidence strength (image weight / average)
 - **Continuous affinity** (not binary): every accent gets a Gaussian-sampled
   weight normalised to [0, 1], driving chroma and lightness interpolation
-- **Chroma**: `lerp(floor, C_ceiling, sqrt(affinity))` where floor = 0.10
-  (assigned) or 0.05 (unassigned), C_ceiling from image saturation
+- **Chroma**: `lerp(floor, c_ceiling[i], sqrt(affinity))` where floor = 0.07
+  (assigned) or 0.05 (unassigned). The per-accent ceiling is harmonized:
+  `c_ceiling[i] = max(MIN_ACCENT_C, gamut_max[i] × sat_fraction)` where
+  `sat_fraction = clamp(C_target_abs / max_gamut, 0.35, 0.92)` and
+  `C_target_abs = clamp(chroma_upper × 1.2, MIN_ACCENT_C, MAX_ACCENT_C)`.
+  All accents sit at the same fraction of their gamut max — yellow doesn't
+  dominate by having more gamut headroom than green, and the most-saturable
+  hue caps at the image's absolute vibrance target so the palette never
+  exceeds what the image suggests
+- **Hue temperature pull** (unassigned slots only): after the local
+  centroid pull, a small additional shift toward the image's circular-mean
+  hue, scaled by the hue distribution's resultant length. Echoes the
+  bases' temperature mood in the accents
 - **Chroma capping** for hue-neighbor pairs (red/orange, orange/brown, etc.):
   if gamut clipping collapses two accents to < 10° post-clip hue separation,
   binary-search for the chroma on the lower-affinity accent that gives 15°
@@ -241,15 +259,19 @@ maximum achievable chroma for a given lightness and hue.
 | `SIGNIFICANCE_FACTOR` | 1.5 | Bins must exceed 1.5× uniform weight to count as significant |
 | `MAX_ASSIGNMENT_DISTANCE` | 45° | Peaks further than this from a target don't claim it |
 | `MAX_PEAKS` | 8 | One peak per accent slot maximum |
-| `MIN_ACCENT_C` | 0.10 | Floor for assigned accent chroma (lerp base) |
-| `UNASSIGNED_ACCENT_C` | 0.07 | Chroma for accents with no image peak — muted but identifiable |
-| `MAX_ACCENT_C` | 0.32 | Ceiling for the most dominant image hues |
+| `MIN_ACCENT_C` | 0.07 | Floor for assigned accent chroma (also the floor of the image-derived ceiling) |
+| `UNASSIGNED_ACCENT_C` | 0.05 | Chroma for accents with no image peak — muted but identifiable |
+| `MAX_ACCENT_C` | 0.32 | Hard ceiling on accent chroma regardless of how vivid the image is |
+| `ACCENT_BOOST` | 1.2× | Headroom above `chroma_upper` so accents read as focal points |
+| `TINT_C_CEILING` | 0.04 | Hard cap on neutral chroma — past this, bases stop reading as neutrals |
+| `TEMPERATURE_PULL` | 5° | Max global hue pull for unassigned accents (scaled by hue concentration) |
+| `sat_fraction` range | 0.35–0.92 | Floor keeps accents visibly chromatic for muted images; ceiling avoids gamut-boundary instability |
 | `MIN_PAIRWISE_DE` | 0.12 | Minimum OKLab ΔE between any two accents |
 | `MIN_CVD_DE` | 0.08 | Minimum OKLab ΔE between accent pairs under CVD simulation |
-| `CHROMA_SCALE_REF` | 0.12 | p85 chroma reference: images at or above this get full C_ceiling |
 | `SAMPLE_LIMIT` | 16 384 | Fast analysis of large images; <1% error vs full scan |
-| `CHROMA_THRESHOLD` | 0.04 | Excludes near-grey pixels from hue statistics |
-| Tone tint C | ≤ 0.06 | Adaptive ceiling with bell-shaped envelope: binary-searched for max contrast-safe value |
+| `CHROMA_THRESHOLD` | 0.04 | Excludes near-grey pixels from *hue* statistics (chroma signal uses all pixels) |
+| Chroma collapse | < 0.03 | k-means cluster gap below this collapses to joint mean (unimodal distribution) |
+| Tone tint C | ≤ 0.04 | Adaptive ceiling with bell-shaped envelope: binary-searched for max contrast-safe value |
 | `MIN_ACCENT_CONTRAST` | 3.0 | Accent contrast against base00/base01 (WCAG AA-large) |
 | `MIN_ACCENT_CONTRAST_BG2` | 2.5 | Accent contrast against base02 (selection highlight) |
 | `MIN_DIFF_PAIR_CR` | 2.5 (1.5 light) | WCAG contrast between diff-paired accents (red/blue, green/blue); red/green at 1.8 for CVD |

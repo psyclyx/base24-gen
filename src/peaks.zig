@@ -56,10 +56,20 @@ pub const ACCENT_TARGETS = [8]AccentTarget{
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-/// A hue peak extracted from the fine histogram.
+/// A hue peak — either extracted from the fine histogram (legacy path,
+/// L/C absent) or pulled directly from a 3D OKLab cluster (preferred path).
 pub const Peak = struct {
-    hue: f32, // circular weighted mean centroid
-    weight: f32, // summed weight of merged bins
+    hue: f32,
+    weight: f32,
+    /// Lightness from the source cluster, or NaN if histogram-derived
+    /// (caller must look up via sampleHueData in that case).
+    L: f32 = std.math.nan(f32),
+    /// Chroma from the source cluster, or NaN if histogram-derived.
+    C: f32 = std.math.nan(f32),
+
+    pub fn hasLabData(self: Peak) bool {
+        return !std.math.isNan(self.L);
+    }
 };
 
 /// Sampled image data at a hue: lightness, chroma, weight, and centroid hue.
@@ -67,9 +77,39 @@ pub const HueData = struct { L: f32, C: f32, weight: f32, centroid_h: f32 };
 
 // ─── Peak extraction ─────────────────────────────────────────────────────────
 
-/// Extract dominant hue peaks from the 36-bin fine histogram.
-/// Merges adjacent significant bins into clusters. Returns count of peaks written.
+/// Extract dominant hue peaks. Prefers 3D OKLab clusters (full L, C, h
+/// info per peak); falls back to histogram-merged hue peaks when clusters
+/// are absent (e.g. tests that construct ImageProfile literals).
 pub fn extractPeaks(profile: analysis.ImageProfile, out: *[MAX_PEAKS]Peak) usize {
+    if (profile.n_clusters > 0) {
+        return extractPeaksFromClusters(profile, out);
+    }
+    return extractPeaksFromHistogram(profile, out);
+}
+
+/// Each colour cluster yields one peak with full (L, C, h) info, sorted by
+/// cluster weight. Clusters whose hue is closer to a different accent slot
+/// will naturally be filtered later by `isClosestSlot`.
+fn extractPeaksFromClusters(profile: analysis.ImageProfile, out: *[MAX_PEAKS]Peak) usize {
+    const n = @min(profile.n_clusters, MAX_PEAKS);
+    for (0..n) |i| {
+        const c = profile.clusters[i];
+        out[i] = .{
+            .hue = c.hue(),
+            .weight = c.weight,
+            .L = c.L,
+            .C = c.chroma(),
+        };
+    }
+    std.mem.sort(Peak, out[0..n], {}, struct {
+        fn cmp(_: void, a: Peak, b: Peak) bool {
+            return a.weight > b.weight;
+        }
+    }.cmp);
+    return n;
+}
+
+fn extractPeaksFromHistogram(profile: analysis.ImageProfile, out: *[MAX_PEAKS]Peak) usize {
     const FINE_BINS = analysis.FINE_BINS;
     const threshold: f32 = SIGNIFICANCE_FACTOR / @as(f32, @floatFromInt(FINE_BINS));
 
