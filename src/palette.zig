@@ -483,8 +483,11 @@ fn evaluateMatching(
             var h: f32 = target.h;
             if (sample.weight > 1e-6) {
                 const max_pull = @min(MAX_HUE_PULL, nearestNeighborDist(i) * 0.4);
-                const avg_weight: f32 = 1.0 / @as(f32, @floatFromInt(analysis.FINE_BINS));
-                const evidence = color.saturate((sample.weight - avg_weight) / (avg_weight * 4.0));
+                // sample.weight is a Gaussian-weighted sum over clusters;
+                // total cluster weight sums to 1, so 0.25 of total nearby is
+                // the saturation point for "this image strongly wants a
+                // colour here."
+                const evidence = color.saturate(sample.weight / 0.25);
                 const raw_pull = std.math.clamp(
                     color.angularDiff(sample.centroid_h, target.h),
                     -max_pull,
@@ -504,24 +507,22 @@ fn evaluateMatching(
         }
     }
 
-    // For peak-assigned slots backed by a 3D cluster, use the cluster's
-    // (L, C, weight) directly — this is the actual colour the image has at
-    // that hue, not a Gaussian-band average. Histogram-derived peaks and
-    // unassigned slots fall back to sampleHueData.
+    // For peak-assigned slots, use the matched cluster's (L, C, weight)
+    // directly — this is the actual colour the image has there, not a
+    // Gaussian-band aggregate. Unassigned slots fall back to sampleHueData,
+    // which Gaussians over all clusters near the canonical hue.
     for (0..8) |i| {
         if (matching[i]) |peak_idx| {
             const p = peaks[peak_idx];
-            if (p.hasLabData()) {
-                img_data[i] = .{
-                    .L = p.L,
-                    .C = p.C,
-                    .weight = p.weight,
-                    .centroid_h = p.hue,
-                };
-                continue;
-            }
+            img_data[i] = .{
+                .L = p.L,
+                .C = p.C,
+                .weight = p.weight,
+                .centroid_h = p.hue,
+            };
+        } else {
+            img_data[i] = sampleHueData(profile, accent_h[i]);
         }
-        img_data[i] = sampleHueData(profile, accent_h[i]);
     }
 
     var max_weight: f32 = 0;
@@ -1137,34 +1138,24 @@ fn dominantBucket(weights: [8]f32) usize {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-const uniform_fine_weights = [_]f32{1.0 / @as(f32, @floatFromInt(analysis.FINE_BINS))} ** analysis.FINE_BINS;
-const uniform_fine_centroids = blk: {
-    var c: [analysis.FINE_BINS]f32 = undefined;
-    for (0..analysis.FINE_BINS) |i| c[i] = @as(f32, @floatFromInt(i)) * 10.0 + 5.0;
-    break :blk c;
-};
-
-fn testFineBinsFromBuckets(bucket_weights: [8]f32) struct { w: [analysis.FINE_BINS]f32, c: [analysis.FINE_BINS]f32 } {
-    var w = [_]f32{0} ** analysis.FINE_BINS;
-    for (0..8) |bi| {
-        if (bucket_weights[bi] <= 0) continue;
-        const start_f: f32 = @as(f32, @floatFromInt(bi)) * 4.5;
-        const start: usize = @intFromFloat(@floor(start_f));
-        const end_f: f32 = start_f + 4.5;
-        const end: usize = @min(analysis.FINE_BINS, @as(usize, @intFromFloat(@ceil(end_f))));
-        const n_bins: f32 = @floatFromInt(end - start);
-        for (start..end) |fi| {
-            w[fi % analysis.FINE_BINS] += bucket_weights[bi] / n_bins;
-        }
+/// Build a synthetic cluster array for tests that need image-derived peaks.
+/// Each (hue, weight) pair becomes one cluster at L=0.5, C=0.18.
+fn testClusters(comptime entries: []const struct { h: f32, w: f32 }) struct {
+    list: [analysis.MAX_CLUSTERS]analysis.ColorCluster,
+    n: usize,
+} {
+    var out: [analysis.MAX_CLUSTERS]analysis.ColorCluster =
+        .{analysis.ColorCluster{ .L = 0, .a = 0, .b = 0, .weight = 0 }} ** analysis.MAX_CLUSTERS;
+    inline for (entries, 0..) |e, i| {
+        const h_rad = e.h * std.math.pi / 180.0;
+        out[i] = .{
+            .L = 0.5,
+            .a = 0.18 * @cos(h_rad),
+            .b = 0.18 * @sin(h_rad),
+            .weight = e.w,
+        };
     }
-    var total: f32 = 0;
-    for (w) |v| total += v;
-    if (total > 0) {
-        for (&w) |*v| v.* /= total;
-    }
-    var c: [analysis.FINE_BINS]f32 = undefined;
-    for (0..analysis.FINE_BINS) |i| c[i] = @as(f32, @floatFromInt(i)) * 10.0 + 5.0;
-    return .{ .w = w, .c = c };
+    return .{ .list = out, .n = entries.len };
 }
 
 test "degenerate: all-black image produces usable dark palette" {
@@ -1184,10 +1175,6 @@ test "degenerate: all-black image produces usable dark palette" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.0,
         .chroma_upper = 0.0,
-        .fine_hue_weights = uniform_fine_weights,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
     };
 
     const palette = generate(black_profile, .dark, .{});
@@ -1226,10 +1213,6 @@ test "degenerate: pure white image produces light palette" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.0,
         .chroma_upper = 0.0,
-        .fine_hue_weights = uniform_fine_weights,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
     };
 
     const palette = generate(white_profile, null, .{}); // auto-detect → light
@@ -1242,14 +1225,15 @@ test "degenerate: pure white image produces light palette" {
 test "hue semantics: red should land near red hue" {
     const testing = std.testing;
     var weights = [_]f32{0} ** 8;
-    weights[0] = 1.0; // bucket 0 = [0°, 45°), contains red (≈27°)
+    weights[0] = 1.0;
     var hues: [8]f32 = undefined;
     for (0..8) |i| hues[i] = @as(f32, @floatFromInt(i)) * 45.0 + 22.5;
 
-    var fine_w = [_]f32{0} ** analysis.FINE_BINS;
-    fine_w[2] = 0.7; // red region
-    fine_w[1] = 0.2;
-    fine_w[3] = 0.1;
+    const cs = testClusters(&.{
+        .{ .h = 25.0, .w = 0.7 },
+        .{ .h = 15.0, .w = 0.2 },
+        .{ .h = 35.0, .w = 0.1 },
+    });
 
     const profile = analysis.ImageProfile{
         .median_lightness = 0.3,
@@ -1262,10 +1246,8 @@ test "hue semantics: red should land near red hue" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.04,
         .chroma_upper = 0.20,
-        .fine_hue_weights = fine_w,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
+        .clusters = cs.list,
+        .n_clusters = cs.n,
     };
 
     const palette = generate(profile, .dark, .{});
@@ -1291,10 +1273,6 @@ test "bright variants are lighter than their base" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.03,
         .chroma_upper = 0.15,
-        .fine_hue_weights = uniform_fine_weights,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
     };
 
     const p = generate(profile, .dark, .{});
@@ -1313,9 +1291,12 @@ test "contrast: primary text (base05 on base00) meets AAA" {
         w[2] = 0.1;
         break :blk w;
     };
-    const vivid_fine = testFineBinsFromBuckets(vivid_bw);
+    const vivid_cs = testClusters(&.{
+        .{ .h = 22.0, .w = 0.6 },
+        .{ .h = 60.0, .w = 0.3 },
+        .{ .h = 100.0, .w = 0.1 },
+    });
     const profiles = [_]analysis.ImageProfile{
-        // Vivid image
         .{
             .median_lightness = 0.3,
             .p10_lightness = 0.1,
@@ -1331,12 +1312,10 @@ test "contrast: primary text (base05 on base00) meets AAA" {
             .mean_hue_strength = 0,
             .chroma_lower = 0.05,
             .chroma_upper = 0.25,
-            .fine_hue_weights = vivid_fine.w,
-            .fine_hue_centroids = vivid_fine.c,
-            .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-            .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
+            .clusters = vivid_cs.list,
+            .n_clusters = vivid_cs.n,
         },
-        // All-black degenerate
+        // All-black degenerate (no clusters → all unassigned canonical hues)
         .{
             .median_lightness = 0.0,
             .p10_lightness = 0.0,
@@ -1352,10 +1331,6 @@ test "contrast: primary text (base05 on base00) meets AAA" {
             .mean_hue_strength = 0,
             .chroma_lower = 0.0,
             .chroma_upper = 0.0,
-            .fine_hue_weights = uniform_fine_weights,
-            .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
         },
     };
     const modes = [_]Mode{ .dark, .light };
@@ -1378,7 +1353,11 @@ test "contrast: all accents meet minimum contrast against base00 and base02" {
         w[5] = 0.1;
         break :blk w;
     };
-    const accent_fine = testFineBinsFromBuckets(accent_bw);
+    const accent_cs = testClusters(&.{
+        .{ .h = 25.0, .w = 0.6 },
+        .{ .h = 145.0, .w = 0.3 },
+        .{ .h = 265.0, .w = 0.1 },
+    });
     const profile = analysis.ImageProfile{
         .median_lightness = 0.3,
         .p10_lightness = 0.1,
@@ -1394,10 +1373,8 @@ test "contrast: all accents meet minimum contrast against base00 and base02" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.04,
         .chroma_upper = 0.20,
-        .fine_hue_weights = accent_fine.w,
-        .fine_hue_centroids = accent_fine.c,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
+        .clusters = accent_cs.list,
+        .n_clusters = accent_cs.n,
     };
 
     for ([_]Mode{ .dark, .light }) |mode| {
@@ -1430,7 +1407,10 @@ test "tint visibility: vivid image produces tint above old ceiling" {
         w[1] = 0.2;
         break :blk w;
     };
-    const tint_fine = testFineBinsFromBuckets(tint_bw);
+    const tint_cs = testClusters(&.{
+        .{ .h = 25.0, .w = 0.8 },
+        .{ .h = 60.0, .w = 0.2 },
+    });
     const profile = analysis.ImageProfile{
         .median_lightness = 0.4,
         .p10_lightness = 0.1,
@@ -1446,10 +1426,8 @@ test "tint visibility: vivid image produces tint above old ceiling" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.05,
         .chroma_upper = 0.28,
-        .fine_hue_weights = tint_fine.w,
-        .fine_hue_centroids = tint_fine.c,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
+        .clusters = tint_cs.list,
+        .n_clusters = tint_cs.n,
     };
 
     const palette = generate(profile, .dark, .{});
@@ -1475,10 +1453,6 @@ test "degenerate: all-black produces zero tint" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.0,
         .chroma_upper = 0.0,
-        .fine_hue_weights = uniform_fine_weights,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.0} ** analysis.FINE_BINS,
     };
 
     const palette = generate(profile, .dark, .{});
@@ -1491,11 +1465,12 @@ test "degenerate: all-black produces zero tint" {
 
 test "diff-pair contrast: red and green are distinct from blue" {
     const testing = std.testing;
-    var fine_w = [_]f32{0} ** analysis.FINE_BINS;
-    fine_w[2] = 0.4;
-    fine_w[5] = 0.3;
-    fine_w[14] = 0.2;
-    fine_w[26] = 0.1;
+    const cs = testClusters(&.{
+        .{ .h = 25.0, .w = 0.4 },
+        .{ .h = 55.0, .w = 0.3 },
+        .{ .h = 145.0, .w = 0.2 },
+        .{ .h = 265.0, .w = 0.1 },
+    });
 
     const profile = analysis.ImageProfile{
         .median_lightness = 0.3,
@@ -1503,9 +1478,9 @@ test "diff-pair contrast: red and green are distinct from blue" {
         .p90_lightness = 0.6,
         .hue_weights = blk: {
             var w = [_]f32{0} ** 8;
-            w[0] = 0.5; // red/orange
-            w[3] = 0.3; // green
-            w[5] = 0.2; // blue
+            w[0] = 0.5;
+            w[3] = 0.3;
+            w[5] = 0.2;
             break :blk w;
         },
         .bucket_hues = blk: {
@@ -1518,10 +1493,8 @@ test "diff-pair contrast: red and green are distinct from blue" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.05,
         .chroma_upper = 0.22,
-        .fine_hue_weights = fine_w,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.15} ** analysis.FINE_BINS,
+        .clusters = cs.list,
+        .n_clusters = cs.n,
     };
 
     for ([_]Mode{ .dark, .light }) |mode| {
@@ -1538,13 +1511,14 @@ test "diff-pair contrast: red and green are distinct from blue" {
 
 test "hue identity: each accent stays within its semantic range" {
     const testing = std.testing;
-    var fine_w = [_]f32{0} ** analysis.FINE_BINS;
-    fine_w[2] = 0.25;
-    fine_w[3] = 0.10;
-    fine_w[5] = 0.25;
-    fine_w[6] = 0.15;
-    fine_w[10] = 0.15;
-    fine_w[11] = 0.10;
+    const cs = testClusters(&.{
+        .{ .h = 25.0, .w = 0.25 },
+        .{ .h = 35.0, .w = 0.10 },
+        .{ .h = 55.0, .w = 0.25 },
+        .{ .h = 65.0, .w = 0.15 },
+        .{ .h = 105.0, .w = 0.15 },
+        .{ .h = 115.0, .w = 0.10 },
+    });
 
     const profile = analysis.ImageProfile{
         .median_lightness = 0.35,
@@ -1567,10 +1541,8 @@ test "hue identity: each accent stays within its semantic range" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.05,
         .chroma_upper = 0.25,
-        .fine_hue_weights = fine_w,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.15} ** analysis.FINE_BINS,
+        .clusters = cs.list,
+        .n_clusters = cs.n,
     };
 
     const p = generate(profile, .dark, .{});
@@ -1600,11 +1572,12 @@ test "nearestNeighborDist: expected distances" {
 
 test "light mode accents are not too dark" {
     const testing = std.testing;
-    var fine_w = [_]f32{0} ** analysis.FINE_BINS;
-    fine_w[2] = 0.3;
-    fine_w[14] = 0.3;
-    fine_w[26] = 0.2;
-    fine_w[19] = 0.2;
+    const cs = testClusters(&.{
+        .{ .h = 25.0, .w = 0.3 },
+        .{ .h = 145.0, .w = 0.3 },
+        .{ .h = 195.0, .w = 0.2 },
+        .{ .h = 265.0, .w = 0.2 },
+    });
 
     const profile = analysis.ImageProfile{
         .median_lightness = 0.65,
@@ -1628,10 +1601,8 @@ test "light mode accents are not too dark" {
         .mean_hue_strength = 0,
         .chroma_lower = 0.05,
         .chroma_upper = 0.22,
-        .fine_hue_weights = fine_w,
-        .fine_hue_centroids = uniform_fine_centroids,
-        .fine_hue_lightness = .{0.5} ** analysis.FINE_BINS,
-        .fine_hue_chroma = .{0.15} ** analysis.FINE_BINS,
+        .clusters = cs.list,
+        .n_clusters = cs.n,
     };
 
     const p = generate(profile, .light, .{});

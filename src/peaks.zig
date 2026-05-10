@@ -9,11 +9,9 @@ const analysis = @import("analysis.zig");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-/// Fine bins with weight > SIGNIFICANCE_FACTOR / FINE_BINS are "significant".
-pub const SIGNIFICANCE_FACTOR: f32 = 1.5;
 /// Maximum angular distance (degrees) for a peak to claim an accent slot.
 pub const MAX_ASSIGNMENT_DISTANCE: f32 = 45.0;
-/// Maximum number of peaks to extract from the fine histogram.
+/// Maximum number of peaks to extract.
 pub const MAX_PEAKS: usize = 8;
 
 /// Gaussian kernel σ (degrees) for sampling hue data.
@@ -56,20 +54,12 @@ pub const ACCENT_TARGETS = [8]AccentTarget{
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-/// A hue peak — either extracted from the fine histogram (legacy path,
-/// L/C absent) or pulled directly from a 3D OKLab cluster (preferred path).
+/// A hue peak pulled from a 3D OKLab cluster — full (L, C, h, weight).
 pub const Peak = struct {
     hue: f32,
     weight: f32,
-    /// Lightness from the source cluster, or NaN if histogram-derived
-    /// (caller must look up via sampleHueData in that case).
-    L: f32 = std.math.nan(f32),
-    /// Chroma from the source cluster, or NaN if histogram-derived.
-    C: f32 = std.math.nan(f32),
-
-    pub fn hasLabData(self: Peak) bool {
-        return !std.math.isNan(self.L);
-    }
+    L: f32,
+    C: f32,
 };
 
 /// Sampled image data at a hue: lightness, chroma, weight, and centroid hue.
@@ -77,20 +67,11 @@ pub const HueData = struct { L: f32, C: f32, weight: f32, centroid_h: f32 };
 
 // ─── Peak extraction ─────────────────────────────────────────────────────────
 
-/// Extract dominant hue peaks. Prefers 3D OKLab clusters (full L, C, h
-/// info per peak); falls back to histogram-merged hue peaks when clusters
-/// are absent (e.g. tests that construct ImageProfile literals).
+/// Extract dominant hue peaks from the 3D OKLab clusters. Each cluster
+/// yields one peak with full (L, C, h) info, sorted by cluster weight.
+/// Clusters whose hue is closer to a different accent slot will be
+/// filtered later by `isClosestSlot`.
 pub fn extractPeaks(profile: analysis.ImageProfile, out: *[MAX_PEAKS]Peak) usize {
-    if (profile.n_clusters > 0) {
-        return extractPeaksFromClusters(profile, out);
-    }
-    return extractPeaksFromHistogram(profile, out);
-}
-
-/// Each colour cluster yields one peak with full (L, C, h) info, sorted by
-/// cluster weight. Clusters whose hue is closer to a different accent slot
-/// will naturally be filtered later by `isClosestSlot`.
-fn extractPeaksFromClusters(profile: analysis.ImageProfile, out: *[MAX_PEAKS]Peak) usize {
     const n = @min(profile.n_clusters, MAX_PEAKS);
     for (0..n) |i| {
         const c = profile.clusters[i];
@@ -109,96 +90,17 @@ fn extractPeaksFromClusters(profile: analysis.ImageProfile, out: *[MAX_PEAKS]Pea
     return n;
 }
 
-fn extractPeaksFromHistogram(profile: analysis.ImageProfile, out: *[MAX_PEAKS]Peak) usize {
-    const FINE_BINS = analysis.FINE_BINS;
-    const threshold: f32 = SIGNIFICANCE_FACTOR / @as(f32, @floatFromInt(FINE_BINS));
-
-    var significant: [FINE_BINS]bool = undefined;
-    for (0..FINE_BINS) |bi| {
-        significant[bi] = profile.fine_hue_weights[bi] > threshold;
-    }
-
-    var n_peaks: usize = 0;
-
-    var start: usize = 0;
-    var found_start = false;
-    for (0..FINE_BINS) |bi| {
-        if (!significant[bi]) {
-            start = (bi + 1) % FINE_BINS;
-            found_start = true;
-            break;
-        }
-    }
-
-    if (!found_start) {
-        var sin_acc: f64 = 0;
-        var cos_acc: f64 = 0;
-        var w_sum: f32 = 0;
-        for (0..FINE_BINS) |bi| {
-            const w: f64 = profile.fine_hue_weights[bi];
-            const h_rad: f64 = profile.fine_hue_centroids[bi] * (std.math.pi / 180.0);
-            sin_acc += w * @sin(h_rad);
-            cos_acc += w * @cos(h_rad);
-            w_sum += profile.fine_hue_weights[bi];
-        }
-        const angle = std.math.atan2(sin_acc, cos_acc) * (180.0 / std.math.pi);
-        out[0] = .{
-            .hue = @floatCast(@mod(angle + 360.0, 360.0)),
-            .weight = w_sum,
-        };
-        return 1;
-    }
-
-    var bi: usize = start;
-    var visited: usize = 0;
-    while (visited < FINE_BINS) {
-        if (!significant[bi]) {
-            bi = (bi + 1) % FINE_BINS;
-            visited += 1;
-            continue;
-        }
-
-        var sin_acc: f64 = 0;
-        var cos_acc: f64 = 0;
-        var w_sum: f32 = 0;
-        while (visited < FINE_BINS and significant[bi]) {
-            const w: f64 = profile.fine_hue_weights[bi];
-            const h_rad: f64 = profile.fine_hue_centroids[bi] * (std.math.pi / 180.0);
-            sin_acc += w * @sin(h_rad);
-            cos_acc += w * @cos(h_rad);
-            w_sum += profile.fine_hue_weights[bi];
-            bi = (bi + 1) % FINE_BINS;
-            visited += 1;
-        }
-
-        if (n_peaks < MAX_PEAKS) {
-            const angle = std.math.atan2(sin_acc, cos_acc) * (180.0 / std.math.pi);
-            out[n_peaks] = .{
-                .hue = @floatCast(@mod(angle + 360.0, 360.0)),
-                .weight = w_sum,
-            };
-            n_peaks += 1;
-        }
-    }
-
-    std.mem.sort(Peak, out[0..n_peaks], {}, struct {
-        fn cmp(_: void, a: Peak, b: Peak) bool {
-            return a.weight > b.weight;
-        }
-    }.cmp);
-
-    return n_peaks;
-}
-
 // ─── Hue sampling ────────────────────────────────────────────────────────────
 
 /// Sample the image's (L, C, weight, centroid_h) at a given hue using a
-/// Gaussian-weighted average over nearby fine histogram bins.
+/// Gaussian-weighted aggregate over the dominant colour clusters.
 ///
-/// centroid_h is the circular mean hue of the nearby image data — the hue
+/// centroid_h is the circular mean hue of nearby cluster colours — the hue
 /// the image "wants" at this location. Used to pull unassigned accents
 /// toward whatever image data exists near their canonical target.
 pub fn sampleHueData(profile: analysis.ImageProfile, hue: f32) HueData {
+    if (profile.n_clusters == 0) return .{ .L = 0.5, .C = 0.0, .weight = 0.0, .centroid_h = hue };
+
     var wL: f64 = 0;
     var wC: f64 = 0;
     var ws: f64 = 0;
@@ -206,15 +108,15 @@ pub fn sampleHueData(profile: analysis.ImageProfile, hue: f32) HueData {
     var cos_acc: f64 = 0;
     const sigma2 = @as(f64, HUE_SAMPLE_SIGMA * HUE_SAMPLE_SIGMA);
 
-    for (0..analysis.FINE_BINS) |fbi| {
-        const w = profile.fine_hue_weights[fbi];
-        if (w < 1e-6) continue;
-        const dh: f64 = color.angularDiff(hue, profile.fine_hue_centroids[fbi]);
+    for (0..profile.n_clusters) |i| {
+        const c = profile.clusters[i];
+        const ch = c.hue();
+        const dh: f64 = color.angularDiff(hue, ch);
         const gauss = @exp(-(dh * dh) / (2.0 * sigma2));
-        const combined: f64 = @as(f64, w) * gauss;
-        wL += combined * @as(f64, profile.fine_hue_lightness[fbi]);
-        wC += combined * @as(f64, profile.fine_hue_chroma[fbi]);
-        const h_rad: f64 = @as(f64, profile.fine_hue_centroids[fbi]) * (std.math.pi / 180.0);
+        const combined: f64 = @as(f64, c.weight) * gauss;
+        wL += combined * @as(f64, c.L);
+        wC += combined * @as(f64, c.chroma());
+        const h_rad: f64 = @as(f64, ch) * (std.math.pi / 180.0);
         sin_acc += combined * @sin(h_rad);
         cos_acc += combined * @cos(h_rad);
         ws += combined;

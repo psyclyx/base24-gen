@@ -25,9 +25,6 @@ const image = @import("image.zig");
 /// vivid region entirely. Cost at this size is well under 100ms.
 const SAMPLE_LIMIT: usize = 65_536;
 
-/// Number of fine hue bins (10° each).
-pub const FINE_BINS: usize = 36;
-
 /// Maximum dominant-colour clusters extracted by 3D OKLab k-means.
 pub const MAX_CLUSTERS: usize = 8;
 
@@ -88,19 +85,9 @@ pub const ImageProfile = struct {
     /// agree (concentrated), 0 = uniform (mean_hue is meaningless). Used as
     /// a confidence weight on the temperature pull.
     mean_hue_strength: f32,
-    /// Fine hue histogram: 36 bins × 10°, chroma-weighted, normalised to sum 1.
-    fine_hue_weights: [FINE_BINS]f32,
-    /// Circular mean hue (degrees) within each fine bin.
-    fine_hue_centroids: [FINE_BINS]f32,
-    /// Chroma-weighted mean OKLab L per fine bin (0.5 for empty bins).
-    fine_hue_lightness: [FINE_BINS]f32,
-    /// Chroma-weighted mean chroma per fine bin (0 for empty bins).
-    fine_hue_chroma: [FINE_BINS]f32,
     /// Dominant colour clusters from 3D OKLab k-means on chromatic pixels,
-    /// sorted by weight descending. Used as the primary peak source for
-    /// accents — each cluster yields a peak with full (L, C, h) info.
-    /// Defaults to empty so test fixtures can omit them and fall back to
-    /// histogram-based peak extraction.
+    /// sorted by weight descending. Each cluster yields a peak with full
+    /// (L, C, h) info — the primary input to accent generation.
     clusters: [MAX_CLUSTERS]ColorCluster = .{ColorCluster{ .L = 0, .a = 0, .b = 0, .weight = 0 }} ** MAX_CLUSTERS,
     /// Number of populated clusters in `clusters`.
     n_clusters: usize = 0,
@@ -136,11 +123,10 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
     var hue_sin_acc = [_]f64{0} ** 8;
     var hue_cos_acc = [_]f64{0} ** 8;
     var hue_L_acc = [_]f64{0} ** 8;
-    var fine_weight_acc = [_]f64{0} ** FINE_BINS;
-    var fine_sin_acc = [_]f64{0} ** FINE_BINS;
-    var fine_cos_acc = [_]f64{0} ** FINE_BINS;
-    var fine_L_acc = [_]f64{0} ** FINE_BINS;
-    var fine_C_acc = [_]f64{0} ** FINE_BINS;
+    // Running totals for circular mean hue / resultant length.
+    var sin_total: f64 = 0;
+    var cos_total: f64 = 0;
+    var hue_total: f64 = 0;
 
     var n: usize = 0;
     var i: usize = 0;
@@ -174,13 +160,9 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
             hue_cos_acc[safe_bucket] += cw * cos_h;
             hue_L_acc[safe_bucket] += cw * @as(f64, lch.L);
 
-            const fine_bin: usize = @intFromFloat(@floor(lch.h / 10.0));
-            const safe_fine = fine_bin % FINE_BINS;
-            fine_weight_acc[safe_fine] += cw;
-            fine_sin_acc[safe_fine] += cw * sin_h;
-            fine_cos_acc[safe_fine] += cw * cos_h;
-            fine_L_acc[safe_fine] += cw * @as(f64, lch.L);
-            fine_C_acc[safe_fine] += cw * c64; // C-weighted mean chroma
+            sin_total += cw * sin_h;
+            cos_total += cw * cos_h;
+            hue_total += cw;
 
             try chromatic.append(allocator, .{
                 .L = lch.L,
@@ -196,9 +178,6 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
     const median_lightness = try weightedPercentile(allocator, ls, sws, 0.5);
     const p10_lightness = try weightedPercentile(allocator, ls, sws, 0.10);
     const p90_lightness = try weightedPercentile(allocator, ls, sws, 0.90);
-
-    var hue_total: f64 = 0;
-    for (hue_weight_acc) |hw| hue_total += hw;
 
     var hue_weights = [_]f32{0} ** 8;
     var bucket_hues = [_]f32{0} ** 8;
@@ -225,49 +204,13 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
         }
     }
 
-    var fine_total: f64 = 0;
-    var sin_total: f64 = 0;
-    var cos_total: f64 = 0;
-    for (0..FINE_BINS) |bi| {
-        fine_total += fine_weight_acc[bi];
-        sin_total += fine_sin_acc[bi];
-        cos_total += fine_cos_acc[bi];
-    }
-    const mean_hue: f32 = if (fine_total > 1e-9) @floatCast(@mod(
+    const mean_hue: f32 = if (hue_total > 1e-9) @floatCast(@mod(
         std.math.atan2(sin_total, cos_total) * (180.0 / std.math.pi) + 360.0,
         360.0,
     )) else 0.0;
-    const mean_hue_strength: f32 = if (fine_total > 1e-9) @floatCast(
-        @sqrt(sin_total * sin_total + cos_total * cos_total) / fine_total,
+    const mean_hue_strength: f32 = if (hue_total > 1e-9) @floatCast(
+        @sqrt(sin_total * sin_total + cos_total * cos_total) / hue_total,
     ) else 0.0;
-
-    var fine_hue_weights = [_]f32{0} ** FINE_BINS;
-    var fine_hue_centroids = [_]f32{0} ** FINE_BINS;
-
-    var fine_hue_lightness = [_]f32{0.5} ** FINE_BINS;
-    var fine_hue_chroma = [_]f32{0} ** FINE_BINS;
-
-    if (fine_total > 0) {
-        for (0..FINE_BINS) |bi| {
-            fine_hue_weights[bi] = @floatCast(fine_weight_acc[bi] / fine_total);
-            if (fine_weight_acc[bi] > 0) {
-                const angle = std.math.atan2(
-                    @as(f64, fine_sin_acc[bi]),
-                    @as(f64, fine_cos_acc[bi]),
-                ) * (180.0 / std.math.pi);
-                fine_hue_centroids[bi] = @floatCast(@mod(angle + 360.0, 360.0));
-                fine_hue_lightness[bi] = @floatCast(fine_L_acc[bi] / fine_weight_acc[bi]);
-                fine_hue_chroma[bi] = @floatCast(fine_C_acc[bi] / fine_weight_acc[bi]);
-            } else {
-                fine_hue_centroids[bi] = @as(f32, @floatFromInt(bi)) * 10.0 + 5.0;
-            }
-        }
-    } else {
-        for (0..FINE_BINS) |bi| {
-            fine_hue_weights[bi] = 1.0 / @as(f32, @floatFromInt(FINE_BINS));
-            fine_hue_centroids[bi] = @as(f32, @floatFromInt(bi)) * 10.0 + 5.0;
-        }
-    }
 
     const km = chromaSignals(chromas[0..n], spatial_w[0..n]);
 
@@ -285,10 +228,6 @@ pub fn analyze(img: image.Image, allocator: std.mem.Allocator) !ImageProfile {
         .chroma_upper = km.upper,
         .mean_hue = mean_hue,
         .mean_hue_strength = mean_hue_strength,
-        .fine_hue_weights = fine_hue_weights,
-        .fine_hue_centroids = fine_hue_centroids,
-        .fine_hue_lightness = fine_hue_lightness,
-        .fine_hue_chroma = fine_hue_chroma,
         .clusters = clusters,
         .n_clusters = n_clusters,
     };
@@ -546,7 +485,10 @@ test "pure red image profile" {
     // Monochrome image → unimodal → both signals collapse to the same vivid value.
     try testing.expectApproxEqAbs(profile.chroma_lower, profile.chroma_upper, 1e-5);
     try testing.expect(profile.chroma_upper > 0.1);
-    try testing.expect(profile.fine_hue_weights[2] > 0.5);
+    // 3D clustering finds at least one red-region cluster.
+    try testing.expect(profile.n_clusters >= 1);
+    const dominant = profile.clusters[0];
+    try testing.expect(dominant.hue() < 50.0 or dominant.hue() > 320.0);
 }
 
 test "pure white image profile" {
@@ -565,9 +507,8 @@ test "pure white image profile" {
     for (profile.hue_weights) |w| {
         try testing.expectApproxEqAbs(1.0 / 8.0, w, 1e-4);
     }
-    for (profile.fine_hue_weights) |w| {
-        try testing.expectApproxEqAbs(1.0 / 36.0, w, 1e-4);
-    }
+    // No chromatic pixels → no clusters extracted.
+    try testing.expectEqual(@as(usize, 0), profile.n_clusters);
 }
 
 test "pure black image profile" {
