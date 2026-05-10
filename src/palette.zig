@@ -215,149 +215,6 @@ pub fn generate(profile: analysis.ImageProfile, forced_mode: ?Mode, config: Conf
     };
 }
 
-/// Metrics for evaluating a palette's quality on both axes.
-pub const Metrics = struct {
-    /// Minimum WCAG contrast ratio across all accent-on-bg pairs.
-    min_accent_bg_contrast: f32,
-    /// Minimum WCAG contrast ratio across diff pairs (green/red on blue).
-    min_diff_pair_contrast: f32,
-    /// Number of accent slots filled from image peaks (0–8).
-    slots_from_image: u8,
-    /// Per-accent affinity (how much image data supports each accent).
-    affinity: [8]f32,
-    /// Per-accent OKLab Delta-L from image ideal (0 = perfect match).
-    delta_L: [8]f32,
-    /// Weighted fidelity cost: sum of |delta_L| * affinity.
-    fidelity_cost: f32,
-};
-
-/// Compute quality metrics for a palette generated from a given profile + config.
-pub fn metrics(profile: analysis.ImageProfile, forced_mode: ?Mode, config: Config) Metrics {
-    const mode: Mode = forced_mode orelse
-        if (profile.median_lightness < 0.5) .dark else .light;
-
-    const tones = buildToneRamp(profile, mode);
-    const sol = solveAccents(profile, mode, tones, config);
-    const accents = sol.result;
-
-    var slots_from_image: u8 = 0;
-    for (0..8) |i| {
-        if (sol.affinity[i] > 0.05) slots_from_image += 1;
-    }
-
-    var min_bg: f32 = 999.0;
-    var delta: [8]f32 = undefined;
-    var cost: f32 = 0;
-    for (0..8) |i| {
-        const cr0 = color.contrastRatio(accents[i], tones[0]);
-        const cr1 = color.contrastRatio(accents[i], tones[1]);
-        const cr2 = color.contrastRatio(accents[i], tones[2]);
-        min_bg = @min(min_bg, @min(cr0, @min(cr1, cr2)));
-        const lch = color.srgbToLch(accents[i]);
-        delta[i] = lch.L - sol.ideal_L[i];
-        cost += @abs(delta[i]) * sol.affinity[i];
-    }
-
-    var min_pair: f32 = 999.0;
-    for (SEPARATION_PAIRS) |pair| {
-        min_pair = @min(min_pair, color.contrastRatio(accents[pair.a], accents[pair.b]));
-    }
-
-    return .{
-        .min_accent_bg_contrast = min_bg,
-        .min_diff_pair_contrast = min_pair,
-        .slots_from_image = slots_from_image,
-        .affinity = sol.affinity,
-        .delta_L = delta,
-        .fidelity_cost = cost,
-    };
-}
-
-/// Full trace of the accent solver's decisions at every stage.
-/// Used by the devtui to show exactly how the palette was derived.
-pub const AccentTrace = struct {
-    // Image analysis inputs
-    overall_scale: f32,
-    /// Image-derived absolute chroma target (chroma_upper × ACCENT_BOOST,
-    /// clamped to [MIN_ACCENT_C, MAX_ACCENT_C]). The "vibrance" of the theme.
-    c_ceiling: f32,
-    /// Per-accent harmonized chroma ceiling — same fraction of each accent's
-    /// gamut max, so all accents share visual weight.
-    c_ceiling_per: [8]f32,
-    /// The shared fraction of gamut max used for harmonization.
-    sat_fraction: f32,
-
-    // Stage 1: peak extraction
-    peaks: [MAX_PEAKS]Peak,
-    n_peaks: usize,
-    sig_threshold: f32,
-    sig_bins: [analysis.FINE_BINS]bool,
-
-    // Stage 2: peak-to-slot assignment + hue selection
-    assignments: [8]?usize,
-    accent_h: [8]f32,
-
-    // Stage 3: continuous affinity + ideal
-    accent_C: [8]f32,
-    ideal_L: [8]f32,
-    affinity: [8]f32,
-    img_data: [8]HueData,
-    accent_L_base: f32,
-
-    // Stage 4: iterative penalty-method optimisation
-    L_bound: [8]f32,
-    final_L: [8]f32,
-    n_matchings_tried: usize,
-    best_score: f32,
-
-    // Final sRGB
-    result: [8]color.Srgb,
-
-    // Constants used
-    L_lo: f32,
-    L_hi: f32,
-};
-
-pub const ACCENT_NAMES = [8][]const u8{ "red", "orange", "yellow", "green", "cyan", "blue", "purple", "brown" };
-
-pub fn traceAccents(profile: analysis.ImageProfile, forced_mode: ?Mode, config: Config) AccentTrace {
-    const mode: Mode = forced_mode orelse
-        if (profile.median_lightness < 0.5) .dark else .light;
-    const tones = buildToneRamp(profile, mode);
-    const sol = solveAccents(profile, mode, tones, config);
-
-    const sig_threshold: f32 = SIGNIFICANCE_FACTOR / @as(f32, @floatFromInt(analysis.FINE_BINS));
-    var sig_bins: [analysis.FINE_BINS]bool = undefined;
-    for (0..analysis.FINE_BINS) |bi| {
-        sig_bins[bi] = profile.fine_hue_weights[bi] > sig_threshold;
-    }
-
-    return .{
-        .overall_scale = sol.overall_scale,
-        .c_ceiling = sol.c_ceiling,
-        .c_ceiling_per = sol.c_ceiling_per,
-        .sat_fraction = sol.sat_fraction,
-        .peaks = sol.peaks,
-        .n_peaks = sol.n_peaks,
-        .sig_threshold = sig_threshold,
-        .sig_bins = sig_bins,
-        .assignments = sol.assignments,
-        .accent_h = sol.accent_h,
-        .accent_C = sol.accent_C,
-        .ideal_L = sol.ideal_L,
-        .affinity = sol.affinity,
-        .img_data = sol.img_data,
-        .accent_L_base = sol.accent_L_base,
-        .L_bound = sol.L_bound,
-        .final_L = sol.final_L,
-        .n_matchings_tried = sol.n_matchings_tried,
-        .best_score = sol.best_score,
-        .result = sol.result,
-        .L_lo = sol.L_lo,
-        .L_hi = sol.L_hi,
-    };
-}
-
 // ─── Tone ramp ────────────────────────────────────────────────────────────────
 
 const ContrastPair = struct { fg: usize, bg: usize, min_ratio: f32 };
@@ -432,34 +289,10 @@ fn toneRampSatisfiesContrast(tint_C: f32, tint_h: f32, mode: Mode) bool {
 const MIN_ACCENT_CONTRAST: f32 = 3.0;
 
 fn buildAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srgb, config: Config) [8]color.Srgb {
-    const r = solveAccents(profile, mode, tones, config);
-    return r.result;
+    return solveAccents(profile, mode, tones, config);
 }
 
-const SolverResult = struct {
-    result: [8]color.Srgb,
-    accent_h: [8]f32,
-    accent_C: [8]f32,
-    affinity: [8]f32,
-    img_data: [8]HueData,
-    ideal_L: [8]f32,
-    L_bound: [8]f32, // feasible boundary per accent (L_min dark, L_max light)
-    final_L: [8]f32,
-    assignments: [8]?usize,
-    peaks: [MAX_PEAKS]Peak,
-    n_peaks: usize,
-    n_matchings_tried: usize,
-    best_score: f32,
-    overall_scale: f32,
-    c_ceiling: f32, // image-derived absolute target
-    c_ceiling_per: [8]f32, // per-accent harmonized ceiling
-    sat_fraction: f32,
-    accent_L_base: f32,
-    L_lo: f32,
-    L_hi: f32,
-};
-
-fn solveAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srgb, config: Config) SolverResult {
+fn solveAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srgb, config: Config) [8]color.Srgb {
     const accent_L_base: f32 = if (mode == .dark) config.accent_l_dark else config.accent_l_light;
     const L_lo: f32 = if (mode == .dark) 0.45 else 0.35;
     const L_hi: f32 = if (mode == .dark) 0.85 else 0.70;
@@ -490,8 +323,6 @@ fn solveAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srg
         c_ceiling[i] = @max(MIN_ACCENT_C, gamut_max_arr[i] * sat_fraction);
     }
 
-    const overall_scale = (C_target_abs - MIN_ACCENT_C) / (MAX_ACCENT_C - MIN_ACCENT_C);
-
     var effective_config = config;
     if (mode == .light) {
         effective_config.min_diff_pair_cr = @min(config.min_diff_pair_cr, 1.5);
@@ -519,7 +350,7 @@ fn solveAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srg
             for (0..n_matchings) |i| {
                 evalMatchingTask(&scores, i, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, c_ceiling, accent_L_base, L_lo, L_hi);
             }
-            return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, c_ceiling, C_target_abs, sat_fraction, accent_L_base, overall_scale, L_lo, L_hi);
+            return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, c_ceiling, accent_L_base, L_lo, L_hi);
         };
         defer pool.deinit();
 
@@ -532,7 +363,7 @@ fn solveAccents(profile: analysis.ImageProfile, mode: Mode, tones: [10]color.Srg
         evalMatchingTask(&scores, 0, &matchings, peaks[0..n_peaks], profile, mode, effective_config, tones, c_ceiling, accent_L_base, L_lo, L_hi);
     }
 
-    return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, c_ceiling, C_target_abs, sat_fraction, accent_L_base, overall_scale, L_lo, L_hi);
+    return finishSolve(&scores, n_matchings, &matchings, peaks, n_peaks, profile, mode, effective_config, tones, c_ceiling, accent_L_base, L_lo, L_hi);
 }
 
 fn finishSolve(
@@ -546,13 +377,10 @@ fn finishSolve(
     config: Config,
     tones: [10]color.Srgb,
     c_ceiling: [8]f32,
-    c_target_abs: f32,
-    sat_fraction: f32,
     accent_L_base: f32,
-    overall_scale: f32,
     L_lo: f32,
     L_hi: f32,
-) SolverResult {
+) [8]color.Srgb {
     var best_idx: usize = 0;
     var best_score: f32 = -std.math.inf(f32);
     for (0..n_matchings) |i| {
@@ -563,31 +391,8 @@ fn finishSolve(
     }
 
     const best_matching = if (n_matchings > 0) matchings[best_idx] else [_]?usize{null} ** 8;
-
     const eval = evaluateMatching(best_matching, peaks[0..n_peaks], profile, mode, config, tones, c_ceiling, accent_L_base, L_lo, L_hi, true);
-
-    return .{
-        .result = eval.result,
-        .accent_h = eval.accent_h,
-        .accent_C = eval.accent_C,
-        .affinity = eval.affinity,
-        .img_data = eval.img_data,
-        .ideal_L = eval.ideal_L,
-        .L_bound = eval.L_bound,
-        .final_L = eval.final_L,
-        .assignments = best_matching,
-        .peaks = peaks,
-        .n_peaks = n_peaks,
-        .n_matchings_tried = n_matchings,
-        .best_score = best_score,
-        .overall_scale = overall_scale,
-        .c_ceiling = c_target_abs,
-        .c_ceiling_per = c_ceiling,
-        .sat_fraction = sat_fraction,
-        .accent_L_base = accent_L_base,
-        .L_lo = L_lo,
-        .L_hi = L_hi,
-    };
+    return eval.result;
 }
 
 // ─── Assignment enumeration ──────────────────────────────────────────────────
@@ -646,13 +451,6 @@ fn evalMatchingTask(
 
 const EvalResult = struct {
     result: [8]color.Srgb,
-    accent_h: [8]f32,
-    accent_C: [8]f32,
-    affinity: [8]f32,
-    img_data: [8]HueData,
-    ideal_L: [8]f32,
-    L_bound: [8]f32,
-    final_L: [8]f32,
     score: f32,
 };
 
@@ -1117,22 +915,7 @@ fn evaluateMatching(
         score += affinity[i] * @max(0.0, 1.0 - @abs(final_L[i] - ideal_L[i]) / L_range);
     }
 
-    var L_bound: [8]f32 = undefined;
-    for (0..8) |i| {
-        L_bound[i] = computeLBound(param_C[i], accent_h[i], base00, base01, base02, mode, L_lo, L_hi, config);
-    }
-
-    return .{
-        .result = result,
-        .accent_h = accent_h,
-        .accent_C = accent_C,
-        .affinity = affinity,
-        .img_data = img_data,
-        .ideal_L = ideal_L,
-        .L_bound = L_bound,
-        .final_L = final_L,
-        .score = score,
-    };
+    return .{ .result = result, .score = score };
 }
 
 fn sq(x: f32) f32 {
