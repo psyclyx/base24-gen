@@ -35,27 +35,42 @@ Arithmetic is in `f32`. The round-trip error for saturated primaries is ~0.7%
 
 ### 1. Image analysis (`analysis.zig`)
 
-Sub-sample to ≤ 16 384 pixels for speed. For each pixel:
+Sub-sample to ≤ 65 536 pixels for speed. Every per-pixel measurement is
+weighted by a centred Gaussian over pixel position (σ = min(w, h) / 3),
+biasing the analysis toward whatever the image's focal subject is —
+polarity-agnostic, so a dark subject on a light background and a light
+subject on a dark background are treated symmetrically.
 
+For each sampled pixel:
 - Convert to OKLCh
-- Accumulate L into a sorted list for percentile computation
-- If C > 0.04 (chromatic pixel): accumulate chroma-weighted hue into both
-  a coarse 8-bucket histogram (45° each) and a fine 36-bin histogram (10°
-  each)
+- Accumulate (L, weight) for weighted percentile computation
+- Accumulate (C, weight) for the 1D chroma-cluster k-means
+- If C > 0.04 (chromatic pixel): accumulate spatial × chroma-weighted hue
+  into a coarse 8-bucket histogram (45° each, used for tone tinting), and
+  push the OKLab (L, a, b, weight) onto the cluster sample list
+- Accumulate sin/cos for the global circular-mean hue and resultant length
+
+After the pass, run **3D weighted k-means in OKLab** on the chromatic
+samples (k-means++ initialisation with a fixed RNG seed for determinism,
+Lloyd's iterations to convergence). The resulting clusters carry full
+(L, a, b, weight) — the actual colours present in the image, not just
+the hues that happen to appear.
 
 Output (`ImageProfile`):
-- `median_lightness`: drives dark/light mode detection (< 0.5 → dark)
-- `p10_lightness`, `p90_lightness`: shadow and highlight levels
-- `hue_weights[8]`, `bucket_hues[8]`: coarse histogram (used for tone tinting)
-- `fine_hue_weights[36]`, `fine_hue_centroids[36]`: fine histogram (used for
-  accent peak extraction)
-- `chroma_lower`, `chroma_upper`: 1D k-means (k=2) cluster means over the
-  per-pixel chroma distribution. The lower mean is the natural chroma of the
-  image's quiet regions (drives base tint); the upper mean is the chroma of
-  the vivid regions (drives accent ceiling). When the distribution is
-  unimodal — monochrome, B&W, noise, or any image without a clear
-  saturated/quiet split — both collapse to the joint mean, which yields a
-  uniform-vibrance theme without artificial popping.
+- `median_lightness`, `p10_lightness`, `p90_lightness`: weighted percentiles
+  driving dark/light mode detection (median < 0.5 → dark)
+- `hue_weights[8]`, `bucket_hues[8]`, `bucket_mean_L[8]`: coarse histogram
+  used for tone-ramp split-toning
+- `chroma_lower`, `chroma_upper`: 1D weighted k-means (k=2) cluster means
+  over per-pixel chromas. Lower = natural chroma of quiet regions (drives
+  base tint); upper = chroma of vivid regions (drives accent ceiling).
+  Unimodal distributions collapse to the joint mean — monochrome, B&W, and
+  noise images correctly yield a single vibrance level for everything
+- `mean_hue`, `mean_hue_strength`: circular weighted-mean hue and resultant
+  length (0..1). Used to bias unassigned accents toward the image's
+  temperature when the hue distribution is concentrated
+- `clusters[..n_clusters]`: dominant colour clusters with full
+  (L, a, b, weight). The primary input to accent generation
 
 ### 2. Tone ramp generation (`palette.zig`)
 
@@ -124,11 +139,11 @@ than fighting the gamut.
 
 Accents are generated through a four-stage pipeline:
 
-**Stage 1 — peak extraction** from the 36-bin fine hue histogram:
-- Bins with weight > 1.5/36 (~0.042) are marked significant
-- Adjacent significant bins are merged circularly into clusters
-- Each cluster yields a peak: circular weighted-mean centroid and summed weight
-- Peaks are sorted by weight (max 8)
+**Stage 1 — peak extraction** from the 3D OKLab clusters:
+- Each cluster yields one peak with full (L, C, h, weight) info
+- Peaks are sorted by cluster weight, capped at 8
+- Distinct colours at similar hues (e.g. bright cyan + dark teal) stay
+  distinct because they form separate clusters in 3D
 
 **Stage 2 — exhaustive assignment** of peaks to accent slots:
 - All valid peak-to-slot matchings are enumerated recursively (typically
@@ -139,11 +154,12 @@ Accents are generated through a four-stage pipeline:
 - The best-scoring matching proceeds to full evaluation
 
 **Stage 3 — hue + chroma selection:**
-- **Assigned slots**: hue = peak centroid hue
+- **Assigned slots**: hue = peak hue; image data anchors (L, C) come
+  directly from the matched cluster
 - **Unassigned slots**: hue pulled toward image data via Gaussian-weighted
-  sampling (σ=30°), limited to preserve hue identity:
+  aggregate over clusters (σ=30°), limited to preserve hue identity:
   - Pull capped at ±25° and 40% of nearest-neighbor distance
-  - Pull scaled by evidence strength (image weight / average)
+  - Pull scaled by evidence strength (sum of cluster weight near the slot)
 - **Continuous affinity** (not binary): every accent gets a Gaussian-sampled
   weight normalised to [0, 1], driving chroma and lightness interpolation
 - **Chroma**: `lerp(floor, c_ceiling[i], sqrt(affinity))` where floor = 0.07
@@ -189,6 +205,10 @@ Soft quality constraints (penalised, not hard):
 - Pairwise OKLab ΔE ≥ 0.12 for all 28 accent pairs (perceptual distinctiveness)
 - CVD-simulated OKLab ΔE ≥ 0.08 for critical pairs under protanopia/deuteranopia
   (red/green, blue/purple, cyan/purple, orange/green)
+- L-spread across the 8 accents ≤ 0.35 (palette-wide harmony — keeps
+  vivid images from scattering accents across the full L range; the
+  threshold equals the natural baseline from yellow's +0.10 dL and brown's
+  −0.15 dL plus a 0.10 tolerance for image-driven variance)
 
 **Two-phase optimisation:**
 
@@ -255,52 +275,56 @@ maximum achievable chroma for a given lightness and hue.
 
 | Constant | Value | Why |
 |----------|-------|-----|
-| `FINE_BINS` | 36 | 10° per bin: fine enough to separate adjacent hue families |
-| `SIGNIFICANCE_FACTOR` | 1.5 | Bins must exceed 1.5× uniform weight to count as significant |
+| `MAX_CLUSTERS` | 8 | One cluster per accent slot maximum |
 | `MAX_ASSIGNMENT_DISTANCE` | 45° | Peaks further than this from a target don't claim it |
-| `MAX_PEAKS` | 8 | One peak per accent slot maximum |
+| `MAX_PEAKS` | 8 | Cap on extracted peaks |
 | `MIN_ACCENT_C` | 0.07 | Floor for assigned accent chroma (also the floor of the image-derived ceiling) |
 | `UNASSIGNED_ACCENT_C` | 0.05 | Chroma for accents with no image peak — muted but identifiable |
 | `MAX_ACCENT_C` | 0.32 | Hard ceiling on accent chroma regardless of how vivid the image is |
 | `ACCENT_BOOST` | 1.2× | Headroom above `chroma_upper` so accents read as focal points |
 | `TINT_C_CEILING` | 0.04 | Hard cap on neutral chroma — past this, bases stop reading as neutrals |
 | `TEMPERATURE_PULL` | 5° | Max global hue pull for unassigned accents (scaled by hue concentration) |
+| `ALLOWED_L_SPREAD` | 0.35 | Threshold above which the palette-wide L-spread harmony penalty triggers |
 | `sat_fraction` range | 0.35–0.92 | Floor keeps accents visibly chromatic for muted images; ceiling avoids gamut-boundary instability |
 | `MIN_PAIRWISE_DE` | 0.12 | Minimum OKLab ΔE between any two accents |
 | `MIN_CVD_DE` | 0.08 | Minimum OKLab ΔE between accent pairs under CVD simulation |
-| `SAMPLE_LIMIT` | 16 384 | Fast analysis of large images; <1% error vs full scan |
-| `CHROMA_THRESHOLD` | 0.04 | Excludes near-grey pixels from *hue* statistics (chroma signal uses all pixels) |
+| `SAMPLE_LIMIT` | 65 536 | Fast analysis of large images; covers small chromatic regions |
+| `SPATIAL_SIGMA_FRAC` | 1/3 | Gaussian σ for spatial weighting, as fraction of min(w, h) |
+| `CHROMA_THRESHOLD` | 0.04 | Excludes near-grey pixels from *hue* statistics and 3D clustering |
 | Chroma collapse | < 0.03 | k-means cluster gap below this collapses to joint mean (unimodal distribution) |
-| Tone tint C | ≤ 0.04 | Adaptive ceiling with bell-shaped envelope: binary-searched for max contrast-safe value |
+| Tone tint C | ≤ 0.04 | Adaptive ceiling with bell-shaped envelope (σ=0.45): binary-searched for max contrast-safe value |
 | `MIN_ACCENT_CONTRAST` | 3.0 | Accent contrast against base00/base01 (WCAG AA-large) |
 | `MIN_ACCENT_CONTRAST_BG2` | 2.5 | Accent contrast against base02 (selection highlight) |
 | `MIN_DIFF_PAIR_CR` | 2.5 (1.5 light) | WCAG contrast between diff-paired accents (red/blue, green/blue); red/green at 1.8 for CVD |
 | Accent L range (dark) | [0.45, 0.85] | Feasible L search range for dark-mode accents |
 | Accent L range (light) | [0.35, 0.70] | Feasible L search range for light-mode accents |
 | Accent L target | 0.65 dark / 0.52 light | Ideal L before constraint enforcement |
-| `HUE_SAMPLE_SIGMA` | 30° | Gaussian kernel width for sampling image hue data |
+| `HUE_SAMPLE_SIGMA` | 30° | Gaussian kernel width for sampling clusters at a target hue |
 | `MAX_HUE_PULL` | 25° | Maximum angular shift for unassigned accents toward image centroid |
 
 ## Why not just extract colours?
 
-Pure extraction (e.g. k-means on image pixels) gives you colours that exist
-in the image but makes no semantic guarantees. If the image has no blue, you
-get no blue — making code, keywords, and functions invisible in some editors.
+Pure extraction (e.g. k-means on image pixels alone) gives you colours that
+exist in the image but makes no semantic guarantees. If the image has no
+blue, you get no blue — making code, keywords, and functions invisible in
+some editors.
 
-Our approach inverts this: we *start* from semantically correct targets and
-*assign* image-derived hues where available. The result is always usable; it
-is also clearly image-derived for hues present in the image, and gracefully
-muted for absent hues.
+We do extract colours (via 3D OKLab k-means), but we *assign* the extracted
+clusters to semantically-correct slots rather than letting them define the
+palette directly. Slots whose hues match a cluster get image-derived
+(L, C, h); slots without a matching cluster keep their canonical hue at
+muted chroma. The result is always usable, always semantically complete,
+and image-derived where the image has the colour.
 
 ## Degenerate case analysis
 
 | Input | Result |
 |-------|--------|
-| All-black | Dark mode, tones correct, all accents unassigned at canonical hues with muted chroma |
-| All-white | Light mode, tones correct, all accents unassigned at canonical hues with muted chroma |
-| Monochrome gradient | Mode from median L; no significant peaks → all accents unassigned |
-| Random noise | Uniform fine histogram → no bins exceed significance threshold → all accents unassigned |
-| Single saturated hue | One peak, one accent assigned with vivid chroma; 7 others muted |
+| All-black | Dark mode, tones correct, no clusters → all accents at canonical hues with floor chroma |
+| All-white | Light mode, tones correct, no clusters → all accents at canonical hues with floor chroma |
+| Monochrome | Mode from median L; one cluster region covers the chromatic pixels; chroma_lower ≈ chroma_upper → uniform vibrance |
+| Random noise | Wide unimodal chroma distribution → collapses to joint mean → uniform-moderate theme |
+| Single saturated hue | One dominant cluster, one accent assigned with vivid chroma; 7 others muted |
 
 All degenerate cases produce valid, readable themes.
 
@@ -322,11 +346,11 @@ terminal in-place. Pipe to `/dev/tty`:
 src/
   color.zig     Color math: sRGB ↔ linear ↔ OKLab ↔ OKLCh, gamut clip, contrast
   image.zig     stb_image wrapper (PNG/JPEG/BMP/…)
-  analysis.zig  Image profiling (lightness percentiles, hue histograms)
-  peaks.zig     Hue peak extraction, image hue sampling, accent target definitions
-  palette.zig   Palette generation algorithm (tone ramp, accent solver, bright variants)
+  analysis.zig  Image profiling: spatial-weighted percentiles, k-means on
+                chroma, 3D OKLab clustering for dominant colours
+  peaks.zig     Cluster-to-peak extraction, hue sampling, accent target defs
+  palette.zig   Palette generation (tone ramp, accent solver, bright variants)
   main.zig      CLI, YAML output, ANSI preview, terminal palette
-  devtui.zig    Interactive TUI for step-by-step accent solver visualization
 vendor/
   stb_image.h   Vendored stb_image v2.29 (single-header C library)
   stb_image.c   Implementation unit (defines STB_IMAGE_IMPLEMENTATION)
