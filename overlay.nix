@@ -1,1 +1,1 @@
-final: prev: { base24-gen = prev.callPackage ./package.nix {}; }
+final: prev: { base24-gen = final.callPackage ./package.nix { }; }
