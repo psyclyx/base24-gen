@@ -9,7 +9,26 @@ stdenv.mkDerivation (finalAttrs: {
   pname = "base24-gen";
   version = "0.1.0";
 
-  src = ./.;
+  # Only the files the build consumes: the build graph (build.zig + zon),
+  # the sources, the vendored stb_image, and the completions installPhase
+  # installs. Entry points (default.nix, package.nix, overlay.nix,
+  # shell.nix), npins/, docs, and sample assets are not package inputs, so
+  # editing them must not churn the source hash.
+  src = builtins.path {
+    # Preserve the store path name the old `src = ./.` copy had — the
+    # unpacked source root name leaks into DWARF compile-unit paths.
+    name = "base24-gen";
+    path = lib.fileset.toSource {
+      root = ./.;
+      fileset = lib.fileset.unions [
+        ./build.zig
+        ./build.zig.zon
+        ./completions
+        ./src
+        ./vendor
+      ];
+    };
+  };
 
   nativeBuildInputs = [
     zig_0_15
